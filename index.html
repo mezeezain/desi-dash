@@ -40,7 +40,8 @@
             align-items:center; justify-content:center; touch-action:none; }
   #pad .b.small { width:calc(var(--s) * 0.82); height:calc(var(--s) * 0.82); }
   #pad .b.jump { width:calc(var(--s) * 1.12); height:calc(var(--s) * 1.12); border-color:#ffd54f; }
-  #pad .b.on { background:rgba(255,213,79,0.6); transform:scale(0.94); }
+  #pad .b.on { background:rgba(255,213,79,0.65); border-color:#fff; }
+  #pad, #pad * { -webkit-touch-callout:none; -webkit-user-select:none; user-select:none; }
 </style>
 </head>
 <body>
@@ -80,29 +81,67 @@ const IS_TOUCH = (window.matchMedia && matchMedia('(pointer: coarse)').matches) 
 
 /** Touch button state, shared by the HTML pad and the InputManager */
 const TOUCH = { left: false, right: false, jump: false, action: false };
+// presses latched until the game reads them, so a tap shorter than one frame is never lost
+const TOUCH_TAP = { jump: false, action: false };
+const TOUCH_META = { dirSince: 0, jumpHoldUntil: 0 };
 (function setupPad() {
   if (IS_TOUCH) document.body.classList.add('touch');
-  const held = new Map();                                       // pointerId -> button key
-  const keyAt = (x, y) => { const el = document.elementFromPoint(x, y); const b = el && el.closest && el.closest('#pad [data-k]'); return b ? b.dataset.k : null; };
+  const held = new Map();                       // pointerId -> button key
+  let buttons = [];                             // cached centres/radii of the visible buttons
+  const measure = () => {
+    buttons = [...document.querySelectorAll('#pad [data-k]')].map(el => {
+      const r = el.getBoundingClientRect();
+      return { el, k: el.dataset.k, x: r.left + r.width / 2, y: r.top + r.height / 2, r: r.width / 2 };
+    }).filter(b => b.r > 0);
+  };
+  window.__measurePad = measure;
+  /** nearest button whose generous touch zone (1.45x its radius) contains the point */
+  const keyAt = (x, y) => {
+    if (!buttons.length) measure();
+    let best = null, bestD = Infinity;
+    for (const b of buttons) {
+      const d = Math.hypot(x - b.x, y - b.y) / b.r;
+      if (d < 1.45 && d < bestD) { best = b.k; bestD = d; }
+    }
+    return best;
+  };
   const sync = () => {
+    const was = { ...TOUCH };
     Object.keys(TOUCH).forEach(k => { TOUCH[k] = false; });
     held.forEach(k => { if (k) TOUCH[k] = true; });
-    document.querySelectorAll('#pad [data-k]').forEach(b => b.classList.toggle('on', TOUCH[b.dataset.k]));
+    const now = performance.now();
+    if (TOUCH.jump && !was.jump) { TOUCH_TAP.jump = true; TOUCH_META.jumpHoldUntil = now + 150; }
+    if (TOUCH.action && !was.action) TOUCH_TAP.action = true;
+    const dir = TOUCH.left || TOUCH.right, wasDir = was.left || was.right;
+    if (dir && (!wasDir || TOUCH.left !== was.left)) TOUCH_META.dirSince = now;
+    const pressedNew = Object.keys(TOUCH).some(k => TOUCH[k] && !was[k]);
+    if (pressedNew && navigator.vibrate) { try { navigator.vibrate(8); } catch (e) { } }
+    buttons.forEach(b => b.el.classList.toggle('on', TOUCH[b.k]));
   };
-  document.addEventListener('pointerdown', e => {
+  const down = e => {
+    if (!document.body.classList.contains('playing')) return;
+    measure();
     const k = keyAt(e.clientX, e.clientY);
     if (!k) return;
-    held.set(e.pointerId, k); sync(); e.preventDefault();
-  }, { passive: false });
-  document.addEventListener('pointermove', e => {
+    held.set(e.pointerId, k); sync();
+    e.preventDefault(); e.stopPropagation();
+  };
+  const move = e => {
     if (!held.has(e.pointerId)) return;
-    held.set(e.pointerId, keyAt(e.clientX, e.clientY)); sync();   // slide from ◀ to ▶
-  });
+    const k = keyAt(e.clientX, e.clientY);
+    // sticky: keep the current button when the thumb drifts off it; switch only onto another button
+    if (k && k !== held.get(e.pointerId)) { held.set(e.pointerId, k); sync(); }
+    e.preventDefault();
+  };
   const end = e => { if (held.delete(e.pointerId)) sync(); };
-  ['pointerup', 'pointercancel'].forEach(t => document.addEventListener(t, end));
+  document.addEventListener('pointerdown', down, { capture: true, passive: false });
+  document.addEventListener('pointermove', move, { capture: true, passive: false });
+  ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(t => document.addEventListener(t, end, true));
+  // safety net: a touchend with no fingers left means nothing is held
+  document.addEventListener('touchend', e => { if (e.touches.length === 0 && held.size) { held.clear(); sync(); } }, true);
   window.addEventListener('blur', () => { held.clear(); sync(); });
-  document.addEventListener('contextmenu', e => { if (keyAt(e.clientX, e.clientY)) e.preventDefault(); });
-  window.__resetTouch = () => { held.clear(); sync(); };
+  document.addEventListener('contextmenu', e => { if (held.size || keyAt(e.clientX, e.clientY)) e.preventDefault(); });
+  window.__resetTouch = () => { held.clear(); sync(); TOUCH_TAP.jump = TOUCH_TAP.action = false; };
 })();
 
 /** On phones: go fullscreen (hides the browser bar) and lock to landscape where supported.
@@ -923,10 +962,15 @@ class InputManager {
   }
   get left()  { const k = this.keys; return !!(k.LEFT.isDown || k.A.isDown || this.touch.left  || this.padBtn(14) || this.stickX() < -0.4); }
   get right() { const k = this.keys; return !!(k.RIGHT.isDown || k.D.isDown || this.touch.right || this.padBtn(15) || this.stickX() > 0.4); }
-  get run()   { const k = this.keys; return !!(k.SHIFT.isDown || k.J.isDown || this.touch.action || this.padBtn(2)); }
+  get run()   {
+    const k = this.keys;
+    const touchAutoRun = (this.touch.left || this.touch.right) && performance.now() - TOUCH_META.dirSince > 450;
+    return !!(k.SHIFT.isDown || k.J.isDown || this.touch.action || touchAutoRun || this.padBtn(2));
+  }
   get jumpHeld() {
     const k = this.keys;
-    return !!(k.SPACE.isDown || k.UP.isDown || k.W.isDown || this.touch.jump || this.padBtn(0));
+    return !!(k.SPACE.isDown || k.UP.isDown || k.W.isDown || this.touch.jump || this.padBtn(0) ||
+              performance.now() < TOUCH_META.jumpHoldUntil);
   }
   get actionHeld() {
     const k = this.keys;
@@ -934,12 +978,14 @@ class InputManager {
   }
   update() {
     const j = this.jumpHeld;
-    this.jumpPressed = j && !this.prevJump;
+    this.jumpPressed = (j && !this.prevJump) || TOUCH_TAP.jump;
     this.prevJump = j;
+    TOUCH_TAP.jump = false;
 
     const a = this.keys.J.isDown || this.padBtn(2) || this.touch.action;
-    this.actionPressed = a && !this.prevAction;
+    this.actionPressed = (a && !this.prevAction) || TOUCH_TAP.action;
     this.prevAction = a;
+    TOUCH_TAP.action = false;
   }
 }
 
@@ -2044,6 +2090,7 @@ function fitToScreen() {
   const size = strip >= 80 ? Math.max(52, Math.min(84, h * 0.2, (strip - 28) / 2.18))
                            : Math.max(60, Math.min(96, h * 0.13, w * 0.09));   // no side strips (tablets)
   document.getElementById('pad').style.setProperty('--s', Math.round(size) + 'px');
+  if (window.__measurePad) requestAnimationFrame(window.__measurePad);
 }
 window.addEventListener('resize', fitToScreen);
 window.addEventListener('orientationchange', () => setTimeout(fitToScreen, 250));
