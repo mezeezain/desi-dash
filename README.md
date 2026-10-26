@@ -55,6 +55,10 @@ Add `?debug` to the URL to see physics hitboxes, or `?touch` to force the on-scr
 
 - [Phaser 3.70](https://phaser.io) (bundled in `lib/` so the game works without a CDN)
 - All art and sound is generated in code: no external assets
+  - Outlined, shaded pixel-art heroes in shalwar kameez, dupattas, a pakol and a cricket kit
+  - Three themed worlds: Lahore's havelis and Minar-e-Pakistan, Karachi's Clifton beach and
+    Mazar-e-Quaid, and the Thar desert with Mohenjo-daro style ruins
+  - Parallax backgrounds, a waving Pakistan flag at each finish, dust, sparkle and confetti effects
 - Progress is saved in the browser's `localStorage`
 
 ## Credits & licence
