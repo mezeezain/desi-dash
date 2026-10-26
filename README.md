@@ -1,13 +1,22 @@
 # Desi Dash 🪁
 
-A Mario-style 2D platformer starring Pakistani heroes, playable right in your browser on desktop and mobile.
+**A Mario-style 2D platformer starring Pakistani heroes, playable free in your browser on desktop and mobile.**
+
+## [▶ PLAY NOW: mezeezain.github.io/desi-dash](https://mezeezain.github.io/desi-dash/)
+
+[![Play Desi Dash](docs/title.png)](https://mezeezain.github.io/desi-dash/)
 
 A storm called **Andhi** has scattered the pieces of the giant festival kite across Pakistan. Pick your hero, run through Lahore, Karachi and the Thar desert, stomp Andhi's minions, collect jalebis and bring the colour back to the sky!
 
-## ▶ Play
+No download or sign-up: open the link and play. On phones, turn your screen sideways and use the on-screen buttons.
 
-Once GitHub Pages is enabled, the game is live at:
-`https://<your-username>.github.io/desi-dash/`
+## Screenshots
+
+| Lahore: Walled City Rooftops | Karachi: Clifton Beach |
+|---|---|
+| ![Lahore level](docs/level-1-1.png) | ![Karachi level](docs/level-1-2.png) |
+| **Thar: Desert Ruins** | **Choose your hero** |
+| ![Thar level](docs/level-1-3.png) | ![Hero select](docs/heroes.png) |
 
 ## Heroes
 
