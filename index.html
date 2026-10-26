@@ -78,10 +78,40 @@ const LEVEL_TIME      = 300;
 const WORLD_H         = 400;   // physics bounds (deeper than camera so falls kill)
 const CAM_H           = 272;
 
+const VERSION = '202610261729';
+// If the phone is showing an old cached copy, reload once with the new version in the URL
+// (a new URL bypasses GitHub Pages' 10-minute cache).
+(function checkForUpdate() {
+  if (location.protocol === 'file:') return;
+  fetch('version.txt?t=' + Date.now(), { cache: 'no-store' }).then(r => r.ok ? r.text() : '').then(v => {
+    v = (v || '').trim();
+    const params = new URLSearchParams(location.search);
+    if (v && v !== VERSION && params.get('v') !== v) { params.set('v', v); location.replace(location.pathname + '?' + params.toString()); }
+  }).catch(() => {});
+})();
 const DEBUG = new URLSearchParams(location.search).has('debug');
 const EXPOSE = DEBUG || new URLSearchParams(location.search).has('test');
 const IS_TOUCH = (window.matchMedia && matchMedia('(pointer: coarse)').matches) || 'ontouchstart' in window
   || new URLSearchParams(location.search).has('touch');
+
+/** Render scale: the game logic stays 480x270, but it is drawn 2-4x larger so movement
+    is smooth on big, high-density screens (each world pixel moves in finer steps). */
+let Z = (() => {
+  const forced = parseInt(new URLSearchParams(location.search).get('z'), 10);
+  if (forced >= 1 && forced <= 4) return forced;
+  const dpr = window.devicePixelRatio || 1;
+  const fit = Math.min(window.innerWidth * dpr / GAME_WIDTH, window.innerHeight * dpr / GAME_HEIGHT);
+  return Math.max(2, Math.min(IS_TOUCH ? 3 : 4, Math.round(fit)));
+})();
+/** every scene draws in 480x270 world units through a zoomed camera anchored top-left */
+function useCam(scene) { return scene.cameras.main.setOrigin(0, 0).setZoom(Z).setRoundPixels(true); }
+/** drop to a lighter render scale on devices that can't keep up (game logic is unaffected) */
+function setRenderScale(game, z) {
+  if (z === Z) return;
+  Z = z;
+  game.scale.setGameSize(GAME_WIDTH * Z, GAME_HEIGHT * Z);
+  game.scene.getScenes(true).forEach(sc => useCam(sc));
+}
 
 /** Touch button state, shared by the HTML pad and the InputManager */
 const TOUCH = { left: false, right: false, jump: false, action: false };
@@ -1104,7 +1134,7 @@ class Player extends Phaser.Physics.Arcade.Sprite {
 
     if (buffered) {
       if (onGround || coyote) {
-        this.doJump(st.jump);
+        this.doJump(st.jump + Math.abs(body.velocity.x) * 0.12);   // running jumps go higher
       } else if (wallDir !== 0) {
         body.setVelocityX(-wallDir * st.walkSpeed * 1.2);
         this.doJump(st.jump * 0.95);
@@ -1116,8 +1146,15 @@ class Player extends Phaser.Physics.Arcade.Sprite {
       }
     }
 
-    // Variable jump height: releasing the button early cuts the jump short
-    if (!inp.jumpHeld && body.velocity.y < -140) body.setVelocityY(-140);
+    // Jump arc: brief hang at the top, quicker fall, and an early release ends the rise smoothly
+    const vy = body.velocity.y;
+    let extraG = 0;
+    if (!onGround) {
+      if (vy < 0 && !inp.jumpHeld) extraG = 1500;           // let go early -> shorter hop
+      else if (Math.abs(vy) < 70 && inp.jumpHeld) extraG = -500; // apex hang while holding
+      else if (vy > 0) extraG = 450;                          // fall a little faster than the rise
+    }
+    body.setGravityY(extraG);
 
     // Wall slide (Bilal)
     if (wallDir !== 0 && body.velocity.y > 70 && ((wallDir < 0 && inp.left) || (wallDir > 0 && inp.right))) {
@@ -1163,7 +1200,7 @@ class Player extends Phaser.Physics.Arcade.Sprite {
       this.speedUntil = 0;
       this.invulnUntil = time + 1600;
       Sfx.hurt();
-      this.scene.cameras.main.shake(120, 0.006);
+      this.scene.cameras.main.shake(120, 0.006 / Z);
     } else {
       this.scene.playerDie();
     }
@@ -1182,7 +1219,7 @@ class Enemy extends Phaser.Physics.Arcade.Sprite {
   }
   wake(time) {
     const cam = this.scene.cameras.main;
-    if (!this.awake && Math.abs(this.x - (cam.scrollX + cam.width / 2)) < cam.width / 2 + 48) {
+    if (!this.awake && Math.abs(this.x - (cam.scrollX + GAME_WIDTH / 2)) < GAME_WIDTH / 2 + 48) {
       this.awake = true;
       this.onWake(time);
     }
@@ -1294,7 +1331,7 @@ const ENEMY_TYPES = { goon: Goon, machhar: Machhar, kawwa: Kawwa };
 
 /* ------------------------------ 10. UI HELPERS ---------------------------- */
 const TXT = (size = 10, color = '#ffffff', extra = {}) =>
-  Object.assign({ fontFamily: 'monospace', fontSize: `${size}px`, color, resolution: 3 }, extra);
+  Object.assign({ fontFamily: 'monospace', fontSize: `${size}px`, color, resolution: Math.max(3, Z) }, extra);
 
 function makeButton(scene, x, y, label, onClick, w = 110, h = 22) {
   const bg = scene.add.rectangle(x, y, w, h, 0x01411c).setStrokeStyle(2, 0xffd54f).setInteractive({ useHandCursor: true });
@@ -1332,6 +1369,7 @@ class BootScene extends Phaser.Scene {
 class MenuScene extends Phaser.Scene {
   constructor() { super('Menu'); }
   create() {
+    useCam(this);
     const L = LEVELS['1-1'], gt = 224;
     buildLevelArt(this, L);
     this.cameras.main.fadeIn(300);
@@ -1410,6 +1448,7 @@ const ABILITY_TEXT = {
 class CharacterSelectScene extends Phaser.Scene {
   constructor() { super('CharacterSelect'); }
   create() {
+    useCam(this);
     this.cameras.main.fadeIn(250);
     this.cameras.main.setBackgroundColor('#0d3b24');
     truckBorder(this);
@@ -1470,6 +1509,7 @@ class CharacterSelectScene extends Phaser.Scene {
 class LevelSelectScene extends Phaser.Scene {
   constructor() { super('LevelSelect'); }
   create() {
+    useCam(this);
     this.cameras.main.fadeIn(250);
     this.cameras.main.setBackgroundColor('#0d3b24');
     truckBorder(this);
@@ -1550,6 +1590,7 @@ class GameScene extends Phaser.Scene {
   }
 
   create() {
+    useCam(this);
     const L = this.L;
     const W = L.width * TILE;
     const gt = L.groundTop * TILE;
@@ -1565,7 +1606,8 @@ class GameScene extends Phaser.Scene {
     /* world + camera */
     this.physics.world.setBounds(0, 0, W, WORLD_H);
     this.physics.world.setBoundsCollision(true, true, false, false);
-    this.cameras.main.setBounds(0, 0, W, CAM_H).setBackgroundColor(L.sky).setRoundPixels(true);
+    this.cameras.main.setBackgroundColor(L.sky);
+    this.levelW = W;
 
     this.buildBackground();
     this.fx = new FX(this, { lahore: 0xd8b48a, karachi: 0xf1deb0, thar: 0xf0c98a }[this.themeName]);
@@ -1650,7 +1692,9 @@ class GameScene extends Phaser.Scene {
     this.inputMgr = new InputManager(this);
     const startX = this.respawnX || 6 * TILE;   // clear of the on-screen buttons at level start
     this.player = new Player(this, startX, gt - 24, this.hero, this.inputMgr);
-    this.cameras.main.startFollow(this.player, true, 0.15, 0.15).setDeadzone(40, 60);
+    this.camFollow = true;
+    this.lookAhead = 0;
+    this.cameras.main.scrollX = Phaser.Math.Clamp(this.player.x - GAME_WIDTH / 2, 0, W - GAME_WIDTH);
 
     /* cricket balls (object pool) */
     this.balls = this.physics.add.group({ maxSize: 3 });
@@ -1863,7 +1907,7 @@ class GameScene extends Phaser.Scene {
     p.body.enable = false;
     p.setAlpha(1).setFrame(7).anims.stop();
     Sfx.hurt();
-    this.cameras.main.stopFollow();
+    this.camFollow = false;
     this.tweens.add({ targets: p, y: p.y - 40, duration: 350, ease: 'Quad.out',
       onComplete: () => this.tweens.add({ targets: p, y: p.y + 320, duration: 800, ease: 'Quad.in' }) });
     this.time.delayedCall(1500, () => {
@@ -1928,8 +1972,28 @@ class GameScene extends Phaser.Scene {
     // balls lifetime
     this.balls.getChildren().forEach(b => { if (b.active && (time > b.dieAt || b.y > CAM_H + 20)) this.killBall(b); });
 
-    // parallax
+    // performance watchdog: if frames drop for ~2 s, render at a lighter scale
+    const now = performance.now();
+    if (!this.fpsWatch) this.fpsWatch = { since: now + 1500, lowFrom: 0 };
+    if (now > this.fpsWatch.since && Z > 1) {
+      if (this.game.loop.actualFps >= 45) this.fpsWatch.lowFrom = 0;
+      else if (!this.fpsWatch.lowFrom) this.fpsWatch.lowFrom = now;
+      else if (now - this.fpsWatch.lowFrom > 2000) {
+        setRenderScale(this.game, Z - 1);
+        this.fpsWatch = { since: now + 2500, lowFrom: 0 };
+      }
+    }
+
+    // smooth camera: frame-rate independent ease toward the hero, with a little look-ahead
     const cam = this.cameras.main;
+    if (this.camFollow) {
+      const k = 1 - Math.pow(0.82, delta / 16.67);
+      this.lookAhead += ((p.facing || 1) * Math.min(48, Math.abs(p.body.velocity.x) * 0.18) - this.lookAhead) * k * 0.5;
+      const target = Phaser.Math.Clamp(p.x + this.lookAhead - GAME_WIDTH / 2, 0, this.levelW - GAME_WIDTH);
+      cam.scrollX += (target - cam.scrollX) * k;
+      cam.scrollY = Phaser.Math.Clamp(cam.scrollY, 0, CAM_H - GAME_HEIGHT);
+    }
+    // parallax
     if (this.far) this.far.tilePositionX = cam.scrollX * 0.12;
     if (this.mid) this.mid.tilePositionX = cam.scrollX * 0.3 + (this.themeName === 'karachi' ? time * 0.004 : 0);
     if (this.near) this.near.tilePositionX = cam.scrollX * 0.55;
@@ -1940,6 +2004,7 @@ class HUDScene extends Phaser.Scene {
   constructor() { super('HUD'); }
   init(data) { this.inputMgr = data.inputMgr; }
   create() {
+    useCam(this);
     const g = this.add.graphics();
     g.fillStyle(0x01411c, 0.95).fillRect(0, 0, GAME_WIDTH, 22);
     g.fillStyle(0xffd54f, 1).fillRect(0, 22, GAME_WIDTH, 1);
@@ -1988,6 +2053,7 @@ class HUDScene extends Phaser.Scene {
 class PauseScene extends Phaser.Scene {
   constructor() { super('Pause'); }
   create() {
+    useCam(this);
     this.add.rectangle(0, 0, GAME_WIDTH, GAME_HEIGHT, 0x000000, 0.6).setOrigin(0);
     this.add.text(GAME_WIDTH / 2, 70, 'PAUSED', TXT(24, '#ffd54f', { fontStyle: 'bold' })).setOrigin(0.5);
     makeButton(this, GAME_WIDTH / 2, 120, 'RESUME', () => this.resumeGame(), 140);
@@ -2010,6 +2076,7 @@ class LevelCompleteScene extends Phaser.Scene {
   constructor() { super('LevelComplete'); }
   init(d) { this.d = d; }
   create() {
+    useCam(this);
     this.cameras.main.fadeIn(250);
     const d = this.d;
     const L = LEVELS[d.levelId];
@@ -2049,6 +2116,7 @@ class GameOverScene extends Phaser.Scene {
   constructor() { super('GameOver'); }
   init(d) { this.d = d; }
   create() {
+    useCam(this);
     this.cameras.main.fadeIn(250);
     this.cameras.main.setBackgroundColor('#1a1a1a');
     this.add.text(GAME_WIDTH / 2, 80, 'GAME OVER', TXT(28, '#e53935', { fontStyle: 'bold', stroke: '#000', strokeThickness: 4 })).setOrigin(0.5);
@@ -2069,8 +2137,8 @@ class GameOverScene extends Phaser.Scene {
 const game = new Phaser.Game({
   type: Phaser.AUTO,
   parent: 'game',
-  width: GAME_WIDTH,
-  height: GAME_HEIGHT,
+  width: GAME_WIDTH * Z,
+  height: GAME_HEIGHT * Z,
   pixelArt: true,
   backgroundColor: '#0b0f14',
   scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH, fullscreenTarget: 'app' },
