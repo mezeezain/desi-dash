@@ -2,17 +2,56 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#01411c" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
 <title>Desi Dash</title>
 <style>
-  html, body { margin:0; padding:0; height:100%; background:#0b0f14; overflow:hidden;
-               font-family: monospace; -webkit-tap-highlight-color: transparent; }
-  #game { width:100vw; height:100vh; display:flex; align-items:center; justify-content:center; }
+  html, body { margin:0; padding:0; width:100%; height:100%; background:#0b0f14; overflow:hidden;
+               position:fixed; inset:0; overscroll-behavior:none; touch-action:none;
+               font-family: monospace; -webkit-tap-highlight-color: transparent;
+               -webkit-user-select:none; user-select:none; }
+  /* 100dvh = the height actually visible (excludes the mobile browser's address bar).
+     JS below also sets the exact pixel size, for browsers without dvh support. */
+  #app { position:fixed; inset:0; background:#0b0f14; }
+  #game { position:fixed; left:0; top:0; width:100vw; height:100vh; height:100dvh;
+          display:flex; align-items:center; justify-content:center; }
   canvas { image-rendering: pixelated; image-rendering: crisp-edges; touch-action: none; }
+  #rotate { display:none; position:fixed; inset:0; z-index:10; background:#01411c; color:#ffd54f;
+            font: bold 20px monospace; text-align:center; flex-direction:column;
+            align-items:center; justify-content:center; gap:18px; padding:24px; }
+  #rotate .icon { font-size:64px; animation: turn 1.6s ease-in-out infinite; }
+  @keyframes turn { 0%,30% { transform: rotate(0deg); } 60%,100% { transform: rotate(90deg); } }
+  @media (orientation: portrait) and (pointer: coarse) { #rotate { display:flex; } }
+
+  /* On-screen controls: HTML buttons in the screen corners, so on wide phones they sit
+     in the empty side strips instead of covering the game. Shown only while playing. */
+  #pad { display:none; position:fixed; inset:0; pointer-events:none; z-index:5;
+         --s: clamp(54px, 19vh, 84px); --gap: calc(var(--s) * 0.18); }
+  body.touch.playing #pad { display:block; }
+  #pad .grp { position:absolute; bottom: max(14px, env(safe-area-inset-bottom)); display:flex; gap:var(--gap);
+              align-items:flex-end; pointer-events:auto; }
+  #pad .l { left: max(14px, env(safe-area-inset-left)); }
+  #pad .r { right: max(14px, env(safe-area-inset-right)); flex-direction:column; align-items:center; }
+  #pad .b { width:var(--s); height:var(--s); border-radius:50%; box-sizing:border-box;
+            border:3px solid rgba(255,255,255,0.8); background:rgba(0,0,0,0.35);
+            color:#fff; font: bold calc(var(--s) * 0.38) monospace; display:flex;
+            align-items:center; justify-content:center; touch-action:none; }
+  #pad .b.small { width:calc(var(--s) * 0.82); height:calc(var(--s) * 0.82); }
+  #pad .b.jump { width:calc(var(--s) * 1.12); height:calc(var(--s) * 1.12); border-color:#ffd54f; }
+  #pad .b.on { background:rgba(255,213,79,0.6); transform:scale(0.94); }
 </style>
 </head>
 <body>
+<div id="app">
 <div id="game"></div>
+<div id="pad">
+  <div class="grp l"><div class="b" data-k="left">◀</div><div class="b" data-k="right">▶</div></div>
+  <div class="grp r"><div class="b small" data-k="action">B</div><div class="b jump" data-k="jump">A</div></div>
+</div>
+<div id="rotate"><div class="icon">📱</div><div>Please turn your phone sideways<br>to play Desi Dash</div></div>
+</div>
 <script src="lib/phaser.min.js"></script>
 <script>
 /* ============================================================================
@@ -36,6 +75,45 @@ const CAM_H           = 272;
 
 const DEBUG = new URLSearchParams(location.search).has('debug');
 const EXPOSE = DEBUG || new URLSearchParams(location.search).has('test');
+const IS_TOUCH = (window.matchMedia && matchMedia('(pointer: coarse)').matches) || 'ontouchstart' in window
+  || new URLSearchParams(location.search).has('touch');
+
+/** Touch button state, shared by the HTML pad and the InputManager */
+const TOUCH = { left: false, right: false, jump: false, action: false };
+(function setupPad() {
+  if (IS_TOUCH) document.body.classList.add('touch');
+  const held = new Map();                                       // pointerId -> button key
+  const keyAt = (x, y) => { const el = document.elementFromPoint(x, y); const b = el && el.closest && el.closest('#pad [data-k]'); return b ? b.dataset.k : null; };
+  const sync = () => {
+    Object.keys(TOUCH).forEach(k => { TOUCH[k] = false; });
+    held.forEach(k => { if (k) TOUCH[k] = true; });
+    document.querySelectorAll('#pad [data-k]').forEach(b => b.classList.toggle('on', TOUCH[b.dataset.k]));
+  };
+  document.addEventListener('pointerdown', e => {
+    const k = keyAt(e.clientX, e.clientY);
+    if (!k) return;
+    held.set(e.pointerId, k); sync(); e.preventDefault();
+  }, { passive: false });
+  document.addEventListener('pointermove', e => {
+    if (!held.has(e.pointerId)) return;
+    held.set(e.pointerId, keyAt(e.clientX, e.clientY)); sync();   // slide from ◀ to ▶
+  });
+  const end = e => { if (held.delete(e.pointerId)) sync(); };
+  ['pointerup', 'pointercancel'].forEach(t => document.addEventListener(t, end));
+  window.addEventListener('blur', () => { held.clear(); sync(); });
+  document.addEventListener('contextmenu', e => { if (keyAt(e.clientX, e.clientY)) e.preventDefault(); });
+  window.__resetTouch = () => { held.clear(); sync(); };
+})();
+
+/** On phones: go fullscreen (hides the browser bar) and lock to landscape where supported.
+    Must be called from a pointerup handler, since browsers only allow it after a tap. */
+function goFullscreen(scene) {
+  if (!IS_TOUCH || !scene.scale.fullscreen.available || scene.scale.isFullscreen) return;
+  scene.scale.once('enterfullscreen', () => {
+    try { screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape').catch(() => {}); } catch (e) { }
+  });
+  try { scene.scale.startFullscreen(); } catch (e) { }
+}
 
 /* ------------------------------ 2. DATA ----------------------------------- */
 const HEROES = [
@@ -827,7 +905,7 @@ class InputManager {
   constructor(scene) {
     this.scene = scene;
     this.keys = scene.input.keyboard.addKeys('LEFT,RIGHT,UP,SPACE,A,D,W,J,SHIFT,ESC,P,ENTER');
-    this.touch = { left: false, right: false, jump: false, action: false };
+    this.touch = TOUCH;
     this.pad = null;
     if (scene.input.gamepad) {
       scene.input.gamepad.once('connected', p => { this.pad = p; });
@@ -1260,7 +1338,7 @@ class MenuScene extends Phaser.Scene {
     const go = () => { Sfx.init(); Sfx.coin(); this.scene.start('CharacterSelect'); };
     this.input.keyboard.once('keydown-ENTER', go);
     this.input.keyboard.once('keydown-SPACE', go);
-    this.input.once('pointerdown', (p, over) => { if (!over.includes(mute)) go(); });
+    this.input.once('pointerup', (p, over) => { if (!over.includes(mute)) { goFullscreen(this); go(); } });
   }
   update(t, dt) {
     this.bgFar.tilePositionX += dt * 0.004;
@@ -1551,7 +1629,9 @@ class GameScene extends Phaser.Scene {
     this.showBanner(`${L.id}  ${L.name}`);
 
     this.keyPause = [this.inputMgr.keys.ESC, this.inputMgr.keys.P];
-    this.events.on('resume', () => { this.inputMgr.touch = { left: false, right: false, jump: false, action: false }; });
+    this.events.on('resume', () => window.__resetTouch());
+    document.body.classList.add('playing');
+    this.events.once('shutdown', () => { document.body.classList.remove('playing'); window.__resetTouch(); });
 
     if (EXPOSE) window.__game = this;
   }
@@ -1831,26 +1911,14 @@ class HUDScene extends Phaser.Scene {
     const pauseBtn = this.add.text(GAME_WIDTH - 8, 4, 'II', TXT(11, '#01411c', { fontStyle: 'bold', backgroundColor: '#ffd54f', padding: { x: 4, y: 1 } }))
       .setOrigin(1, 0).setInteractive({ useHandCursor: true });
     pauseBtn.on('pointerdown', () => { if (this.inputMgr) this.inputMgr.pausePressed = true; });
+    if (IS_TOUCH && this.scale.fullscreen.available) {
+      const fs = this.add.text(GAME_WIDTH - 34, 4, '⛶', TXT(11, '#01411c', { fontStyle: 'bold', backgroundColor: '#ffd54f', padding: { x: 3, y: 1 } }))
+        .setOrigin(1, 0).setInteractive({ useHandCursor: true });
+      fs.on('pointerup', () => { if (this.scale.isFullscreen) this.scale.stopFullscreen(); else goFullscreen(this); });
+      this.timeT.x -= 22;
+    }
 
-    const isTouch = this.sys.game.device.input.touch || new URLSearchParams(location.search).has('touch');
-    if (isTouch && this.inputMgr) this.buildTouch();
-  }
 
-  buildTouch() {
-    this.input.addPointer(3);
-    const im = this.inputMgr;
-    const make = (x, y, r, label, flag) => {
-      const c = this.add.circle(x, y, r, 0xffffff, 0.22).setStrokeStyle(2, 0xffffff, 0.5).setInteractive();
-      this.add.text(x, y, label, TXT(14, '#ffffff', { fontStyle: 'bold' })).setOrigin(0.5).setAlpha(0.8);
-      const on = () => { im.touch[flag] = true; c.setFillStyle(0xffffff, 0.45); };
-      const off = () => { im.touch[flag] = false; c.setFillStyle(0xffffff, 0.22); };
-      c.on('pointerdown', on); c.on('pointerover', (p) => { if (p.isDown) on(); });
-      c.on('pointerup', off); c.on('pointerout', off);
-    };
-    make(36, GAME_HEIGHT - 34, 24, '◀', 'left');
-    make(94, GAME_HEIGHT - 34, 24, '▶', 'right');
-    make(GAME_WIDTH - 38, GAME_HEIGHT - 40, 26, 'A', 'jump');
-    make(GAME_WIDTH - 96, GAME_HEIGHT - 28, 20, 'B', 'action');
   }
 
   update() {
@@ -1955,13 +2023,33 @@ const game = new Phaser.Game({
   height: GAME_HEIGHT,
   pixelArt: true,
   backgroundColor: '#0b0f14',
-  scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
+  scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH, fullscreenTarget: 'app' },
   physics: { default: 'arcade', arcade: { gravity: { y: GRAVITY }, debug: DEBUG } },
   input: { gamepad: true, activePointers: 4 },
   scene: [BootScene, MenuScene, CharacterSelectScene, LevelSelectScene, GameScene, HUDScene,
           PauseScene, LevelCompleteScene, GameOverScene]
 });
 if (EXPOSE) window.__phaser = game;
+
+// Keep the game exactly the size of the *visible* screen (mobile address bars change it).
+function fitToScreen() {
+  const el = document.getElementById('game');
+  const vv = window.visualViewport;
+  el.style.width = Math.round(vv ? vv.width : window.innerWidth) + 'px';
+  el.style.height = Math.round(vv ? vv.height : window.innerHeight) + 'px';
+  if (game.canvas && game.isBooted) game.scale.refresh();
+  // size the touch buttons to fit the empty strips beside the game where possible
+  const w = vv ? vv.width : window.innerWidth, h = vv ? vv.height : window.innerHeight;
+  const strip = (w - Math.min(w, h * GAME_WIDTH / GAME_HEIGHT)) / 2;
+  const size = strip >= 80 ? Math.max(52, Math.min(84, h * 0.2, (strip - 28) / 2.18))
+                           : Math.max(60, Math.min(96, h * 0.13, w * 0.09));   // no side strips (tablets)
+  document.getElementById('pad').style.setProperty('--s', Math.round(size) + 'px');
+}
+window.addEventListener('resize', fitToScreen);
+window.addEventListener('orientationchange', () => setTimeout(fitToScreen, 250));
+if (window.visualViewport) window.visualViewport.addEventListener('resize', fitToScreen);
+game.events.once('ready', fitToScreen);
+fitToScreen();
 </script>
 </body>
 </html>
