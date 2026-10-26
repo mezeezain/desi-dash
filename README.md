@@ -4,7 +4,7 @@
 
 ## [▶ PLAY NOW: mezeezain.github.io/desi-dash](https://mezeezain.github.io/desi-dash/)
 
-[![Play Desi Dash](docs/title.png)](https://mezeezain.github.io/desi-dash/)
+[![Play Desi Dash](docs/title.jpg)](https://mezeezain.github.io/desi-dash/)
 
 A storm called **Andhi** has scattered the pieces of the giant festival kite across Pakistan. Pick your hero, run through Lahore, Karachi and the Thar desert, stomp Andhi's minions, collect jalebis and bring the colour back to the sky!
 
@@ -14,9 +14,9 @@ No download or sign-up: open the link and play. On phones, turn your screen side
 
 | Lahore: Walled City Rooftops | Karachi: Clifton Beach |
 |---|---|
-| ![Lahore level](docs/level-1-1.png) | ![Karachi level](docs/level-1-2.png) |
+| ![Lahore level](docs/level-1-1.jpg) | ![Karachi level](docs/level-1-2.jpg) |
 | **Thar: Desert Ruins** | **Choose your hero** |
-| ![Thar level](docs/level-1-3.png) | ![Hero select](docs/heroes.png) |
+| ![Thar level](docs/level-1-3.jpg) | ![Hero select](docs/heroes.jpg) |
 
 ## Heroes
 
@@ -64,7 +64,8 @@ Add `?debug` to the URL to see physics hitboxes, or `?touch` to force the on-scr
 
 - [Phaser 3.70](https://phaser.io) (bundled in `lib/` so the game works without a CDN)
 - All art and sound is generated in code: no external assets
-  - Outlined, shaded pixel-art heroes in shalwar kameez, dupattas, a pakol and a cricket kit
+  - Smooth, 3D-shaded cartoon heroes in shalwar kameez, dupattas, a pakol and a cricket kit,
+    drawn at 3x detail with soft ground shadows
   - Three themed worlds: Lahore's havelis and Minar-e-Pakistan, Karachi's Clifton beach and
     Mazar-e-Quaid, and the Thar desert with Mohenjo-daro style ruins
   - Parallax backgrounds, a waving Pakistan flag at each finish, dust, sparkle and confetti effects

@@ -7,6 +7,9 @@
 <meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <title>Desi Dash</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@600;800&display=swap" rel="stylesheet" />
 <style>
   html, body { margin:0; padding:0; width:100%; height:100%; background:#0b0f14; overflow:hidden;
                position:fixed; inset:0; overscroll-behavior:none; touch-action:none;
@@ -17,7 +20,7 @@
   #app { position:fixed; inset:0; background:#0b0f14; }
   #game { position:fixed; left:0; top:0; width:100vw; height:100vh; height:100dvh;
           display:flex; align-items:center; justify-content:center; }
-  canvas { image-rendering: pixelated; image-rendering: crisp-edges; touch-action: none; }
+  canvas { touch-action: none; }
   #rotate { display:none; position:fixed; inset:0; z-index:10; background:#01411c; color:#ffd54f;
             font: bold 20px monospace; text-align:center; flex-direction:column;
             align-items:center; justify-content:center; gap:18px; padding:24px; }
@@ -78,7 +81,7 @@ const LEVEL_TIME      = 300;
 const WORLD_H         = 400;   // physics bounds (deeper than camera so falls kill)
 const CAM_H           = 272;
 
-const VERSION = '202610261801';
+const VERSION = '202610262016';
 // If the phone is showing an old cached copy, reload once with the new version in the URL
 // (a new URL bypasses GitHub Pages' 10-minute cache).
 (function checkForUpdate() {
@@ -96,6 +99,7 @@ const IS_TOUCH = (window.matchMedia && matchMedia('(pointer: coarse)').matches) 
 
 /** Render scale: the game logic stays 480x270, but it is drawn 2-4x larger so movement
     is smooth on big, high-density screens (each world pixel moves in finer steps). */
+const Z_FORCED = parseInt(new URLSearchParams(location.search).get('z'), 10) > 0;
 let Z = (() => {
   const forced = parseInt(new URLSearchParams(location.search).get('z'), 10);
   if (forced >= 1 && forced <= 4) return forced;
@@ -288,34 +292,32 @@ const LEVELS = {
 };
 const LEVEL_ORDER = ['1-1', '1-2', '1-3'];
 
-/* ------------------------------ 3. ART (procedural pixel art) -------------- */
-/* Everything is drawn in code on small canvases, then given a 1px dark outline,
-   so the game needs no image files at all. */
+/* ------------------------------ 3. ART (procedural, hi-res, 3D-shaded) ----- */
+/* Everything is drawn in code, so the game needs no image files. Textures are painted
+   at S x the world size (S texels per world pixel) with gradients, bevels and highlights,
+   then displayed at 1/S scale, so sizes and hitboxes in the world never change. */
 
-function makeTex(scene, key, w, h, draw) {
-  if (scene.textures.exists(key)) return;
-  const t = scene.textures.createCanvas(key, w, h);
-  const ctx = t.getContext();
-  draw(ctx, w, h);
-  t.refresh();
-}
+const S = 3;
+const OUT = '#2b1a12';                         // warm dark outline colour
 
-/* ---- colour + canvas helpers ---- */
+/* ---- colour helpers ---- */
 function hexRgb(h) {
   h = h.replace('#', '');
   if (h.length === 3) h = h.split('').map(c => c + c).join('');
   const n = parseInt(h.slice(0, 6), 16);
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
-function shade(hex, f) {                       // f > 0 lighten, f < 0 darken
-  const [r, g, b] = hexRgb(hex);
-  const m = v => Math.round(f >= 0 ? v + (255 - v) * f : v * (1 + f));
-  return `rgb(${m(r)},${m(g)},${m(b)})`;
+/** lighten (f > 0) or darken (f < 0) a hex colour, returns hex */
+function lit(hex, f) {
+  const m = v => Math.max(0, Math.min(255, Math.round(f >= 0 ? v + (255 - v) * f : v * (1 + f))));
+  return '#' + hexRgb(hex).map(v => m(v).toString(16).padStart(2, '0')).join('');
 }
+const shade = lit;
 function mix(a, b, t) {
   const A = hexRgb(a), B = hexRgb(b);
   return '#' + A.map((v, i) => Math.round(v + (B[i] - v) * t).toString(16).padStart(2, '0')).join('');
 }
+function rgba(hex, a) { const [r, g, b] = hexRgb(hex); return `rgba(${r},${g},${b},${a})`; }
 function rng(seed) {                            // deterministic random (mulberry32)
   return () => {
     seed |= 0; seed = seed + 0x6D2B79F5 | 0;
@@ -324,47 +326,59 @@ function rng(seed) {                            // deterministic random (mulberr
     return ((t ^ t >>> 14) >>> 0) / 4294967296;
   };
 }
-function newCanvas(w, h) {
-  const c = document.createElement('canvas');
-  c.width = w; c.height = h;
+
+/* ---- canvas helpers (all coordinates in world pixels; the context is pre-scaled) ---- */
+function newCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+function prep(x) { x.lineJoin = 'round'; x.lineCap = 'round'; return x; }
+function hiArt(w, h, draw) {
+  const c = newCanvas(Math.round(w * S), Math.round(h * S));
+  const x = prep(c.getContext('2d'));
+  x.scale(S, S);
+  draw(x, w, h);
   return c;
 }
-function painter(ctx) {
-  const R = (x, y, w, h, c) => { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), w, h); };
-  R.px = (x, y, c) => R(x, y, 1, 1, c);
-  R.ctx = ctx;
-  return R;
-}
-/** add a 1px outline around every opaque pixel */
-function outline(src, color = '#2a1a14') {
-  const w = src.width, h = src.height;
-  const d = src.getContext('2d').getImageData(0, 0, w, h).data;
-  const out = newCanvas(w, h);
-  const o = out.getContext('2d');
-  o.fillStyle = color;
-  const a = (x, y) => (x < 0 || y < 0 || x >= w || y >= h) ? 0 : d[(y * w + x) * 4 + 3];
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    if (a(x, y) > 40) continue;
-    if (a(x - 1, y) > 40 || a(x + 1, y) > 40 || a(x, y - 1) > 40 || a(x, y + 1) > 40) o.fillRect(x, y, 1, 1);
-  }
-  o.drawImage(src, 0, 0);
-  return out;
-}
-function sprite(w, h, draw, outlineColor = '#2a1a14') {
-  const c = newCanvas(w, h);
-  draw(painter(c.getContext('2d')), c.getContext('2d'), w, h);
-  return outlineColor ? outline(c, outlineColor) : c;
+function makeTex(scene, key, w, h, draw) {     // hi-res texture in the texture manager
+  if (scene.textures.exists(key)) return;
+  scene.textures.addCanvas(key, hiArt(w, h, draw));
 }
 function addSheet(scene, key, fw, fh, frames) {
   if (scene.textures.exists(key)) return;
-  const t = scene.textures.createCanvas(key, fw * frames.length, fh);
+  const W = Math.round(fw * S), H = Math.round(fh * S);
+  const t = scene.textures.createCanvas(key, W * frames.length, H);
   const ctx = t.getContext();
-  frames.forEach((f, i) => { ctx.drawImage(f, i * fw, 0); t.add(i, 0, i * fw, 0, fw, fh); });
+  frames.forEach((f, i) => { ctx.drawImage(f, i * W, 0); t.add(i, 0, i * W, 0, W, H); });
   t.refresh();
 }
-function addImage(scene, key, canvas) {
-  if (!scene.textures.exists(key)) scene.textures.addCanvas(key, canvas);
+function addImage(scene, key, canvas) { if (!scene.textures.exists(key)) scene.textures.addCanvas(key, canvas); }
+
+const LG = (x, x0, y0, x1, y1, stops) => { const g = x.createLinearGradient(x0, y0, x1, y1); stops.forEach(([o, c]) => g.addColorStop(o, c)); return g; };
+const RG = (x, cx, cy, r, stops, fx = cx, fy = cy, fr = 0) => { const g = x.createRadialGradient(fx, fy, fr, cx, cy, r); stops.forEach(([o, c]) => g.addColorStop(o, c)); return g; };
+function rrect(x, X, Y, W, H, R) {
+  R = Math.min(R, W / 2, H / 2);
+  x.beginPath();
+  x.moveTo(X + R, Y); x.lineTo(X + W - R, Y); x.quadraticCurveTo(X + W, Y, X + W, Y + R);
+  x.lineTo(X + W, Y + H - R); x.quadraticCurveTo(X + W, Y + H, X + W - R, Y + H);
+  x.lineTo(X + R, Y + H); x.quadraticCurveTo(X, Y + H, X, Y + H - R);
+  x.lineTo(X, Y + R); x.quadraticCurveTo(X, Y, X + R, Y); x.closePath();
 }
+function paint(x, fill, lw = 0.7, stroke = OUT) {
+  x.fillStyle = fill; x.fill();
+  if (lw) { x.lineWidth = lw; x.strokeStyle = stroke; x.stroke(); }
+}
+function ellipse(x, cx, cy, rx, ry, fill, lw = 0.7, stroke = OUT) {
+  x.beginPath(); x.ellipse(cx, cy, Math.max(0.01, rx), Math.max(0.01, ry), 0, 0, Math.PI * 2); paint(x, fill, lw, stroke);
+}
+/** rounded limb: outlined thick line with a left-lit cylinder gradient */
+function limb(x, x0, y0, x1, y1, w, col) {
+  x.beginPath(); x.moveTo(x0, y0); x.lineTo(x1, y1);
+  x.strokeStyle = OUT; x.lineWidth = w + 1.2; x.stroke();
+  const mx = (x0 + x1) / 2;
+  x.strokeStyle = LG(x, mx - w / 2, 0, mx + w / 2, 0, [[0, lit(col, 0.28)], [0.45, col], [1, lit(col, -0.28)]]);
+  x.lineWidth = w; x.stroke();
+}
+/** sphere shading: light from the top-left */
+const sphere = (x, cx, cy, r, col) => RG(x, cx, cy, r, [[0, lit(col, 0.55)], [0.35, lit(col, 0.12)], [0.8, col], [1, lit(col, -0.35)]], cx - r * 0.38, cy - r * 0.42, r * 0.05);
+const gloss = (x, cx, cy, rx, ry, a = 0.55) => { x.beginPath(); x.ellipse(cx, cy, rx, ry, -0.5, 0, Math.PI * 2); x.fillStyle = `rgba(255,255,255,${a})`; x.fill(); };
 
 /* ---- heroes ---- */
 const FW = 24, FH = 32, HERO_FRAMES = 8;
@@ -379,268 +393,368 @@ const HERO_STYLE = {
 };
 
 function drawHero(p, s, frame) {
-  return sprite(FW, FH, R => {
-    const sk = p.skin, skD = shade(sk, -0.2);
-    const top = s.top || p.top, topD = shade(top, -0.25), topL = shade(top, 0.18);
-    const bot = p.bottom, botD = shade(bot, -0.22);
-    const hair = p.hair, hairL = shade(hair, 0.28);
-    const scarf = p.scarf || top;
+  return hiArt(FW, FH, x => {
+    const sk = p.skin, top = s.top || p.top, bot = p.bottom, hair = p.hair;
+    const dup = s.ajrak ? '#b71c1c' : (s.dupattaColor || p.scarf || top);
 
-    // pose for each frame: back/front leg x-offset & lift, arm swing, body bob, cloth sway
+    // pose per frame
     let lb = 0, lf = 0, yb = 0, yf = 0, b = 0, aB = 0, aF = 0, sway = 0, armUp = false, armsOut = false;
     switch (frame) {
-      case 1: b = 1; break;
-      case 2: lb = -2; lf = 2; aB = 1; aF = -1; sway = 1; break;
-      case 3: yb = -1; b = -1; break;
-      case 4: lb = 2; lf = -2; aB = -1; aF = 1; sway = -1; break;
-      case 5: yf = -1; b = -1; break;
-      case 6: lb = -1; lf = 2; yf = -3; armUp = true; sway = 2; break;
+      case 1: b = 0.6; break;
+      case 2: lb = -2; lf = 2; aB = 1.2; aF = -1.2; sway = 1; break;
+      case 3: yb = -1; b = -0.7; break;
+      case 4: lb = 2; lf = -2; aB = -1.2; aF = 1.2; sway = -1; break;
+      case 5: yf = -1; b = -0.7; break;
+      case 6: lb = -1; lf = 2.5; yf = -3; armUp = true; sway = 2; break;
       case 7: lb = -2; lf = 2; yb = -1; armsOut = true; sway = -2; break;
     }
-    const cutY = s.cut === 'long' ? 24 : s.cut === 'mid' ? 22 : 21;
+    const cutY = s.cut === 'long' ? 24.6 : s.cut === 'mid' ? 22.6 : 21.4;
+    const hx = 12.2, hy = 7.6 + b;                        // head centre
 
-    /* --- things behind the body --- */
-    if (s.girl) {                                   // long hair falls behind the shoulders
-      R(7, 4 + b, 3, 14, hair);
-      R(6 + (sway > 0 ? -1 : 0), 10 + b, 2, 9, hair);
-      R(7, 5 + b, 1, 6, hairL);
+    /* --- behind the body --- */
+    if (s.girl) {                                          // long hair down the back
+      x.beginPath();
+      x.moveTo(8.2, 5 + b);
+      x.bezierCurveTo(5.2, 9 + b, 5.6 - sway * 0.4, 15 + b, 6.4 - sway * 0.6, 19.4 + b);
+      x.quadraticCurveTo(8.6, 20.6 + b, 10.4, 18.6 + b);
+      x.lineTo(10.6, 6 + b); x.closePath();
+      paint(x, LG(x, 5, 0, 11, 0, [[0, lit(hair, 0.18)], [1, lit(hair, -0.2)]]));
     }
-    if (s.bat) {                                    // cricket bat slung on the back
-      R(4, 12 + b, 3, 10, '#e2c08d'); R(4, 12 + b, 1, 10, '#f3dcb0'); R(6, 12 + b, 1, 10, '#b8925a');
-      R(5, 7 + b, 2, 5, '#5d4037'); R(5, 6 + b, 2, 1, '#8d6e63');
+    if (s.bat) {                                           // cricket bat slung on the back
+      x.save(); x.translate(6.4, 16.5 + b); x.rotate(-0.42);
+      rrect(x, -1.4, -5.5, 2.8, 10.5, 1.1); paint(x, LG(x, -1.4, 0, 1.4, 0, [[0, '#f6dfb2'], [0.5, '#e2c08d'], [1, '#b8925a']]), 0.6);
+      rrect(x, -0.6, -10.2, 1.2, 4.9, 0.5); paint(x, '#4e342e', 0.5);
+      x.restore();
     }
-    if (s.dupatta) {                                // dupatta tail flowing behind
-      const dc = s.ajrak ? '#b71c1c' : (s.dupattaColor || scarf);
-      R(5 - Math.max(0, sway), 13 + b, 2, 8 + Math.abs(sway), dc);
-      R(4 - Math.max(0, sway), 18 + b, 2, 4, shade(dc, -0.15));
+    if (s.dupatta) {                                       // dupatta tail flowing behind
+      x.beginPath();
+      x.moveTo(7.8, 12.6 + b);
+      x.bezierCurveTo(5.2 - sway, 15 + b, 4.6 - sway * 1.4, 19 + b, 3.6 - sway * 1.6, 22.4 + b);
+      x.lineTo(6.0 - sway, 22.6 + b);
+      x.bezierCurveTo(6.4, 19 + b, 7.6, 16 + b, 9.4, 13.4 + b);
+      x.closePath();
+      paint(x, LG(x, 3, 0, 9, 0, [[0, lit(dup, -0.25)], [1, lit(dup, 0.1)]]), 0.6);
     }
 
     /* --- back arm + legs --- */
-    if (armsOut) R(4, 13 + b, 4, 2, topD);
-    else R(6, 13 + b + aB, 2, 6, topD), R(6, 19 + b + aB, 2, 2, skD);
-    R(9 + lb, 21, 3, 8 + yb, botD);
-    R(9 + lb, 29 + yb, 4, 2, shade(p.shoe, -0.25));
-    R(12 + lf, 21, 3, 8 + yf, bot);
-    R(12 + lf, 29 + yf, 4, 2, p.shoe);
-    R(12 + lf, 28 + yf, 3, 1, shade(bot, 0.12));       // shalwar cuff highlight
+    if (armsOut) limb(x, 8.4, 13.8 + b, 4.6, 13.2 + b, 2.4, lit(top, -0.22));
+    else limb(x, 8.4, 13.8 + b, 7.4 + aB * 0.4, 18.6 + b + aB, 2.4, lit(top, -0.22));
+    ellipse(x, armsOut ? 4.0 : 7.3 + aB * 0.4, armsOut ? 13.2 + b : 19.6 + b + aB, 1.2, 1.2, lit(sk, -0.15), 0.5);
+
+    const legBack = lit(bot, -0.2);
+    limb(x, 10.6 + lb * 0.4, 21.2, 10.6 + lb, 28.4 + yb, 3.2, legBack);
+    ellipse(x, 11.2 + lb, 29.9 + yb, 2.5, 1.25, LG(x, 0, 28.6 + yb, 0, 31.2 + yb, [[0, lit(p.shoe, 0.1)], [1, lit(p.shoe, -0.45)]]), 0.55);
+    limb(x, 13.6 + lf * 0.4, 21.2, 13.6 + lf, 28.4 + yf, 3.2, bot);
+    ellipse(x, 14.3 + lf, 29.9 + yf, 2.6, 1.3, LG(x, 0, 28.6 + yf, 0, 31.2 + yf, [[0, lit(p.shoe, 0.35)], [1, lit(p.shoe, -0.3)]]), 0.55);
+    gloss(x, 13.4 + lf, 29.3 + yf, 0.9, 0.35, 0.6);
 
     /* --- torso (kameez / shirt) --- */
-    R(8, 12 + b, 8, cutY - 12, top);
-    if (s.cut === 'long') { R(7, 20 + b, 10, cutY - 20, top); R(7, 23 + b, 10, 1, topD); }
-    R(8, 12 + b, 1, cutY - 12, topL);                    // light from the left
-    R(15, 12 + b, 1, cutY - 12, topD);
-    R(11, 12 + b, 2, 2, sk);                              // neckline
-    R(11, 14 + b, 1, 1, sk);
-    if (s.trim) { R(8, 12 + b, 8, 1, s.trim); R(8, cutY - 1 + b, 8, 1, s.trim); R(12, 15 + b, 2, 2, '#ffffff'); }
-    if (s.vest) { R(8, 13 + b, 3, 8, s.vest); R(13, 13 + b, 3, 8, s.vest); R(8, 13 + b, 1, 8, shade(s.vest, 0.2)); }
-    if (s.buttons) for (let y = 15; y < 21; y += 2) R(12, y + b, 1, 1, shade(top, 0.4));
-    if (s.dupatta) {                                      // dupatta over the shoulders
-      const dc = s.ajrak ? '#b71c1c' : (s.dupattaColor || scarf);
-      R(7, 12 + b, 10, 2, dc);
-      R(14, 14 + b, 2, 4, dc);
-      if (s.ajrak) for (let x = 7; x < 17; x += 2) R(x, 12 + b, 1, 1, '#1a237e'), R(x + 1, 13 + b, 1, 1, '#ffffff');
+    const flare = s.cut === 'long' ? 1.3 : 0.5;
+    x.beginPath();
+    x.moveTo(8.0, 12.4 + b);
+    x.quadraticCurveTo(12.2, 11.4 + b, 16.4, 12.4 + b);
+    x.lineTo(16.6 + flare, cutY + b * 0.5);
+    x.quadraticCurveTo(12.2, cutY + 0.9 + b * 0.5, 7.8 - flare, cutY + b * 0.5);
+    x.closePath();
+    paint(x, LG(x, 7, 0, 17.5, 0, [[0, lit(top, 0.3)], [0.35, lit(top, 0.08)], [0.75, top], [1, lit(top, -0.3)]]), 0.7);
+    x.save(); x.clip();
+    x.fillStyle = LG(x, 0, 12 + b, 0, cutY, [[0, 'rgba(255,255,255,0.18)'], [0.3, 'rgba(255,255,255,0)'], [1, 'rgba(0,0,0,0.12)']]);
+    x.fillRect(6, 11 + b, 13, cutY - 10);
+    if (s.cut === 'long') { x.strokeStyle = rgba(lit(top, -0.35), 0.6); x.lineWidth = 0.45; x.beginPath(); x.moveTo(10.4, 17 + b); x.lineTo(9.6, cutY); x.moveTo(14.6, 17 + b); x.lineTo(15.4, cutY); x.stroke(); }
+    if (s.trim) { x.fillStyle = s.trim; x.fillRect(6, cutY - 1.2 + b * 0.5, 13, 0.9); }
+    if (s.vest) {
+      x.fillStyle = LG(x, 7, 0, 17, 0, [[0, lit(s.vest, 0.3)], [0.5, s.vest], [1, lit(s.vest, -0.3)]]);
+      x.fillRect(7.6, 12 + b, 3.8, 10); x.fillRect(13.2, 12 + b, 3.8, 10);
+      x.fillStyle = '#d4af37'; x.fillRect(11.2, 12.6 + b, 0.35, 9); x.fillRect(13.2, 12.6 + b, 0.35, 9);
+    }
+    x.restore();
+    // neckline
+    x.beginPath(); x.moveTo(11.0, 12.1 + b); x.lineTo(12.2, 14.4 + b); x.lineTo(13.4, 12.1 + b); x.closePath();
+    paint(x, s.trim || lit(sk, -0.05), 0.4);
+    if (s.trim) ellipse(x, 13.5, 16 + b, 1.0, 1.0, '#ffffff', 0.4);   // cricket badge
+    if (s.buttons) for (let yy = 15; yy < 21; yy += 2) ellipse(x, 12.3, yy + b, 0.45, 0.45, lit(top, 0.45), 0.3);
+    if (s.dupatta) {                                       // dupatta draped over the shoulders
+      x.beginPath();
+      x.moveTo(7.4, 12.4 + b); x.quadraticCurveTo(12.2, 14.6 + b, 16.8, 12.2 + b);
+      x.lineTo(17.0, 14.0 + b); x.lineTo(16.2, 19.4 + b); x.lineTo(14.6, 19.2 + b); x.lineTo(15.0, 15.0 + b);
+      x.quadraticCurveTo(11.6, 16.2 + b, 7.6, 14.2 + b); x.closePath();
+      paint(x, LG(x, 7, 0, 17, 0, [[0, lit(dup, 0.25)], [0.6, dup], [1, lit(dup, -0.25)]]), 0.55);
+      if (s.ajrak) {
+        x.save(); x.clip();
+        for (let i = 0; i < 9; i++) { ellipse(x, 7.8 + i * 1.2, 13.2 + b + (i % 2) * 0.6, 0.35, 0.35, '#1a237e', 0); ellipse(x, 15.6, 15.5 + b + i * 0.5, 0.25, 0.25, '#ffffff', 0); }
+        x.restore();
+      }
     }
 
     /* --- front arm --- */
-    if (armUp) { R(15, 7 + b, 2, 6, top); R(15, 6 + b, 2, 2, sk); }
-    else if (armsOut) { R(15, 12 + b, 5, 2, top); R(20, 12 + b, 2, 2, sk); }
-    else { R(16, 13 + b + aF, 2, 6, top); R(16, 19 + b + aF, 2, 2, sk); }
+    if (armUp) { limb(x, 16.2, 13.6 + b, 17.0, 8.2 + b, 2.5, top); ellipse(x, 17.1, 7.2 + b, 1.3, 1.3, sphere(x, 17.1, 7.2 + b, 1.3, sk), 0.5); }
+    else if (armsOut) { limb(x, 16.2, 13.6 + b, 20.6, 12.8 + b, 2.5, top); ellipse(x, 21.6, 12.8 + b, 1.3, 1.3, sphere(x, 21.6, 12.8 + b, 1.3, sk), 0.5); }
+    else { limb(x, 16.2, 13.6 + b, 16.8 + aF * 0.3, 18.6 + b + aF, 2.5, top); ellipse(x, 16.9 + aF * 0.3, 19.7 + b + aF, 1.3, 1.3, sphere(x, 16.9, 19.7 + b + aF, 1.3, sk), 0.5); }
 
     /* --- head --- */
-    R(9, 3 + b, 6, 1, sk);
-    R(8, 4 + b, 8, 7, sk);
-    R(9, 11 + b, 6, 1, sk);
-    R(15, 5 + b, 1, 5, skD);                              // jaw shadow
-    R(11, 12 + b, 2, 1, skD);                             // neck
-    // face (looking right)
-    R(11, 7 + b, 1, 2, '#1d1d1d'); R(14, 7 + b, 1, 2, '#1d1d1d');
-    R(11, 7 + b, 1, 1, '#4a4a4a'); R(14, 7 + b, 1, 1, '#4a4a4a');
-    R(13, 10 + b, 2, 1, '#7b3328');
-    if (s.girl) { R(10, 9 + b, 1, 1, '#e88a8a'); R(15, 9 + b, 1, 1, '#e88a8a'); }
-    else { R(11, 6 + b, 1, 1, hair); R(14, 6 + b, 1, 1, hair); }
+    rrect(x, 11.2, 11 + b, 2.2, 2, 0.6); paint(x, lit(sk, -0.18), 0);                     // neck
+    ellipse(x, hx, hy, 5.3, 5.1, RG(x, hx, hy, 5.6, [[0, lit(sk, 0.32)], [0.55, sk], [1, lit(sk, -0.25)]], hx - 1.8, hy - 2.2, 0.3), 0.75);
+    if (!s.girl) ellipse(x, 8.4, hy + 0.6, 1.0, 1.3, lit(sk, -0.12), 0.5);                // ear
+    // eyes looking right
+    [[12.9, 0.95], [15.7, 0.8]].forEach(([ex, w]) => {
+      ellipse(x, ex, hy + 0.4, w, 1.3, '#ffffff', 0.35);
+      ellipse(x, ex + 0.25, hy + 0.55, w * 0.68, 0.95, '#2b1d16', 0);
+      ellipse(x, ex + 0.05, hy + 0.05, 0.3, 0.3, '#ffffff', 0);
+    });
+    x.strokeStyle = lit(hair, 0.1); x.lineWidth = 0.55;
+    x.beginPath(); x.moveTo(12.0, hy - 1.6); x.lineTo(13.6, hy - 1.9); x.moveTo(15.0, hy - 1.9); x.lineTo(16.4, hy - 1.6); x.stroke();
+    x.strokeStyle = '#7b2b20'; x.lineWidth = 0.55; x.beginPath(); x.arc(14.7, hy + 2.0, 1.0, 0.25 * Math.PI, 0.8 * Math.PI); x.stroke();
+    ellipse(x, 11.6, hy + 2.0, 0.85, 0.45, 'rgba(235,105,105,0.45)', 0);
+    ellipse(x, 16.6, hy + 2.0, 0.6, 0.4, 'rgba(235,105,105,0.4)', 0);
 
     /* --- hair + caps --- */
-    R(9, 2 + b, 6, 1, hair);
-    R(8, 3 + b, 8, 2, hair);
-    R(8, 5 + b, 2, 3, hair);                              // back of head
-    R(14, 5 + b, 2, 1, hair);                             // fringe
-    R(10, 2 + b, 3, 1, hairL);
-    if (s.girl) { R(15, 5 + b, 1, 3, hair); R(11, 3 + b, 1, 1, hairL); }
-    else R(9, 7 + b, 1, 2, skD);                          // ear
+    x.beginPath();
+    x.moveTo(7.0, hy + 1.6);
+    x.bezierCurveTo(6.4, hy - 4.6, 11.0, hy - 6.6, 15.4, hy - 4.6);
+    x.quadraticCurveTo(17.6, hy - 3.4, 17.4, hy - 1.4);
+    x.quadraticCurveTo(16.2, hy - 2.0, 15.6, hy - 2.8);               // fringe
+    x.quadraticCurveTo(14.6, hy - 1.8, 13.4, hy - 2.6);
+    x.quadraticCurveTo(11.6, hy - 1.8, 10.4, hy - 2.4);
+    x.quadraticCurveTo(9.8, hy - 0.6, 9.6, hy + 1.4);
+    x.closePath();
+    paint(x, RG(x, 10.5, hy - 3.6, 7.5, [[0, lit(hair, 0.35)], [0.5, hair], [1, lit(hair, -0.3)]], 10, hy - 4.4, 0.4), 0.7);
+    x.strokeStyle = rgba('#ffffff', 0.35); x.lineWidth = 0.6;
+    x.beginPath(); x.arc(11.6, hy - 1.2, 3.6, 1.15 * Math.PI, 1.55 * Math.PI); x.stroke();          // hair shine
+    if (s.girl) { x.beginPath(); x.moveTo(16.4, hy - 2.6); x.quadraticCurveTo(17.8, hy + 1, 17.0, hy + 3.4); x.lineTo(16.2, hy + 1); x.closePath(); paint(x, lit(hair, -0.05), 0.5); }
 
     if (s.cap === 'cricket') {
-      R(8, 1 + b, 8, 3, p.cap); R(9, 0 + b, 6, 1, p.cap);
-      R(14, 3 + b, 5, 1, shade(p.cap, -0.3));
-      R(10, 1 + b, 2, 1, shade(p.cap, 0.3));
-      R(12, 2 + b, 1, 1, '#ffffff');
+      x.beginPath(); x.ellipse(12.4, hy - 2.4, 5.6, 4.0, 0, Math.PI, 0); x.closePath();
+      paint(x, RG(x, 12.4, hy - 3, 6, [[0, lit(p.cap, 0.4)], [0.6, p.cap], [1, lit(p.cap, -0.35)]], 10.6, hy - 5.2, 0.3), 0.7);
+      x.beginPath(); x.ellipse(17.6, hy - 2.2, 3.4, 0.9, 0.05, 0, Math.PI * 2); paint(x, LG(x, 0, hy - 3, 0, hy - 1.2, [[0, lit(p.cap, 0.1)], [1, lit(p.cap, -0.45)]]), 0.6);
+      ellipse(x, 12.4, hy - 6.3, 0.6, 0.45, lit(p.cap, -0.2), 0.4);
+      ellipse(x, 13.2, hy - 4.2, 0.7, 0.55, '#ffffff', 0);
     } else if (s.cap === 'topi') {
-      R(8, 1 + b, 8, 3, p.cap); R(8, 3 + b, 8, 1, shade(p.cap, 0.35));
-      for (let x = 9; x < 16; x += 2) R(x, 2 + b, 1, 1, shade(p.cap, 0.25));
+      rrect(x, 7.2, hy - 7.0, 10.0, 4.6, 1.4);
+      paint(x, LG(x, 7, 0, 17.2, 0, [[0, lit(p.cap, 0.35)], [0.5, p.cap], [1, lit(p.cap, -0.35)]]), 0.7);
+      x.fillStyle = '#d4af37'; x.fillRect(7.4, hy - 3.5, 9.6, 0.8);
+      for (let i = 0; i < 5; i++) ellipse(x, 8.4 + i * 2, hy - 5.2, 0.35, 0.35, '#e8c560', 0);
     } else if (s.cap === 'pakol') {
-      R(7, 0 + b, 10, 2, p.cap); R(7, 2 + b, 10, 2, shade(p.cap, -0.28));
-      R(8, 0 + b, 4, 1, shade(p.cap, 0.25));
+      rrect(x, 6.2, hy - 4.6, 12.2, 2.8, 1.4);
+      paint(x, LG(x, 0, hy - 4.6, 0, hy - 1.8, [[0, lit(p.cap, 0.05)], [1, lit(p.cap, -0.4)]]), 0.7);
+      x.beginPath(); x.ellipse(12.3, hy - 5.0, 6.4, 2.2, 0, 0, Math.PI * 2);
+      paint(x, RG(x, 12.3, hy - 5, 6.5, [[0, lit(p.cap, 0.35)], [1, lit(p.cap, -0.15)]], 10.4, hy - 6, 0.3), 0.7);
     }
   });
 }
 
 /* ---- enemies ---- */
-function drawGoon(f) {   // Gol Gappa Goon: a crispy puri with attitude
-  return sprite(16, 16, R => {
-    const c = R.ctx;
-    c.fillStyle = '#e3a948'; c.beginPath(); c.arc(8, 8, 6.5, 0, Math.PI * 2); c.fill();
-    c.fillStyle = '#c47f2c'; c.beginPath(); c.arc(9, 9.5, 5, 0.1, Math.PI * 0.9); c.fill();
-    c.fillStyle = '#f6cf7a'; c.fillRect(4, 4, 3, 2); c.fillRect(3, 6, 1, 2);
-    R(7, 2, 3, 2, '#5d7f2c'); R(8, 2, 1, 1, '#9ccc65');           // hole with pani
-    R(4, 6, 3, 1, '#3e2723'); R(10, 6, 3, 1, '#3e2723');          // angry brows
-    R(5, 7, 2, 2, '#ffffff'); R(10, 7, 2, 2, '#ffffff');
-    R(5, 8, 1, 1, '#1b1b1b'); R(10, 8, 1, 1, '#1b1b1b');
-    R(6, 11, 4, 1, '#5d2c0e');
+function drawGoon(f) {     // Gol Gappa Goon: a crispy puri with attitude
+  return hiArt(16, 16, x => {
     const s = f ? 1 : -1;
-    R(4 + s, 14, 3, 1, '#6d3b12'); R(9 - s, 14, 3, 1, '#6d3b12');
+    ellipse(x, 5 + s * 0.8, 14.4, 2.0, 1.0, LG(x, 0, 13.4, 0, 15.4, [[0, '#8d5524'], [1, '#4e2a0e']]), 0.5);
+    ellipse(x, 11 - s * 0.8, 14.4, 2.0, 1.0, LG(x, 0, 13.4, 0, 15.4, [[0, '#8d5524'], [1, '#4e2a0e']]), 0.5);
+    ellipse(x, 8, 8.4, 6.6, 6.2, sphere(x, 8, 8.4, 6.6, '#e3a948'), 0.75);
+    const r = rng(7 + f);
+    for (let i = 0; i < 14; i++) ellipse(x, 3 + r() * 10, 6 + r() * 7, 0.35, 0.25, 'rgba(150,80,20,0.45)', 0);
+    ellipse(x, 8, 2.8, 2.2, 1.0, RG(x, 8, 2.8, 2.2, [[0, '#9ccc65'], [1, '#33691e']]), 0.5);   // hole with pani
+    gloss(x, 5.2, 5.0, 1.8, 0.9, 0.5);
+    ellipse(x, 5.6, 8.0, 1.25, 1.35, '#ffffff', 0.4); ellipse(x, 10.4, 8.0, 1.25, 1.35, '#ffffff', 0.4);
+    ellipse(x, 5.3, 8.4, 0.65, 0.8, '#1b1b1b', 0); ellipse(x, 10.1, 8.4, 0.65, 0.8, '#1b1b1b', 0);
+    x.strokeStyle = '#3e2723'; x.lineWidth = 0.8;
+    x.beginPath(); x.moveTo(4.0, 5.9); x.lineTo(7.0, 6.9); x.moveTo(12.0, 5.9); x.lineTo(9.0, 6.9); x.stroke();
+    x.strokeStyle = '#5d2c0e'; x.lineWidth = 0.6; x.beginPath(); x.arc(8, 12.6, 1.6, 1.15 * Math.PI, 1.85 * Math.PI); x.stroke();
   });
 }
-function drawMachhar(f) { // faces left
-  return sprite(16, 16, R => {
-    const wy = f ? 1 : 4;
-    R(6, wy, 4, 4, 'rgba(200,230,255,0.75)'); R(10, wy + 1, 3, 3, 'rgba(200,230,255,0.6)');
-    R(5, 6, 4, 4, '#4e4a46');                                     // thorax
-    for (let i = 0; i < 4; i++) R(9 + i, 7 + (i > 1 ? 1 : 0), 1, 3, i % 2 ? '#f5f5f5' : '#2b2b2b'); // striped abdomen
-    R(3, 6, 3, 3, '#3e3a36'); R(3, 6, 1, 1, '#e53935');            // head + red eye
-    R(0, 8, 3, 1, '#2b2b2b');                                      // proboscis
-    R(5, 10, 1, 4, '#2b2b2b'); R(7, 10, 1, 4, '#2b2b2b'); R(9, 10, 1, 3, '#2b2b2b');
+function drawMachhar(f) {  // faces left
+  return hiArt(16, 16, x => {
+    const wy = f ? -1.2 : 1.4;
+    [[7.2, 3.6 + wy, 3.2, 1.6, -0.4], [10.4, 4.2 + wy, 2.8, 1.4, 0.3]].forEach(([cx, cy, rx, ry, rot]) => {
+      x.beginPath(); x.ellipse(cx, cy, rx, ry, rot, 0, Math.PI * 2);
+      paint(x, LG(x, cx - rx, cy - ry, cx + rx, cy + ry, [[0, 'rgba(230,245,255,0.9)'], [1, 'rgba(150,200,240,0.45)']]), 0.4, 'rgba(60,80,100,0.8)');
+    });
+    x.strokeStyle = '#2b2b2b'; x.lineWidth = 0.45;
+    x.beginPath(); [[5.6, 9], [7.4, 9.4], [9.2, 9.2]].forEach(([lx, ly]) => { x.moveTo(lx, ly); x.lineTo(lx - 0.8, ly + 4.4); }); x.stroke();
+    x.beginPath(); x.ellipse(11.2, 8.6, 3.4, 1.9, 0.25, 0, Math.PI * 2);
+    paint(x, LG(x, 8, 0, 14.6, 0, [[0, '#3a3a3a'], [0.2, '#f5f5f5'], [0.35, '#2b2b2b'], [0.5, '#f5f5f5'], [0.65, '#2b2b2b'], [0.8, '#f5f5f5'], [1, '#2b2b2b']]), 0.55);
+    ellipse(x, 6.6, 8.0, 2.2, 1.9, sphere(x, 6.6, 8.0, 2.2, '#5d5650'), 0.55);
+    ellipse(x, 4.0, 7.6, 1.6, 1.5, sphere(x, 4.0, 7.6, 1.6, '#4e4842'), 0.5);
+    ellipse(x, 3.4, 7.2, 0.6, 0.6, '#ff5252', 0); ellipse(x, 3.25, 7.0, 0.2, 0.2, '#ffffff', 0);
+    x.strokeStyle = '#1f1f1f'; x.lineWidth = 0.55; x.beginPath(); x.moveTo(2.6, 8.4); x.lineTo(0.3, 9.6); x.stroke();
   });
 }
-function drawKawwa(f) {   // house crow, faces right
-  return sprite(20, 16, R => {
-    R(4, 6, 10, 6, '#1c1c1c');                                     // body
-    R(12, 4, 5, 5, '#1c1c1c'); R(10, 5, 3, 4, '#6b6b6b');          // head + grey nape
-    R(17, 6, 3, 2, '#2b2b2b'); R(17, 6, 2, 1, '#555');             // beak
-    R(14, 5, 2, 2, '#ffffff'); R(15, 5, 1, 1, '#111');             // eye
-    R(0, 7, 5, 3, '#141414');                                      // tail
-    if (f) { R(5, 1, 7, 5, '#262626'); R(6, 1, 4, 1, '#444'); }    // wing up
-    else { R(5, 10, 7, 4, '#262626'); R(6, 13, 4, 1, '#444'); }    // wing down
-    R(8, 12, 1, 3, '#555'); R(11, 12, 1, 3, '#555');
+function drawKawwa(f) {    // house crow, faces right
+  return hiArt(20, 16, x => {
+    x.beginPath(); x.moveTo(5, 8.6); x.lineTo(0.4, 7.2); x.lineTo(0.8, 10.6); x.closePath(); paint(x, '#1a1a1a', 0.5);   // tail
+    ellipse(x, 9, 9.2, 5.4, 3.4, RG(x, 9, 9, 6, [[0, '#4a5568'], [0.4, '#232831'], [1, '#0e0f12']], 7.5, 7.6, 0.3), 0.7);
+    ellipse(x, 14.6, 6.8, 3.0, 2.8, RG(x, 14.6, 6.8, 3.2, [[0, '#3d4452'], [1, '#121418']], 13.8, 5.6, 0.2), 0.6);
+    x.beginPath(); x.ellipse(12.2, 7.6, 1.8, 2.4, 0.4, 0, Math.PI * 2); x.fillStyle = 'rgba(140,140,140,0.75)'; x.fill();    // grey nape
+    x.beginPath(); x.moveTo(17.2, 5.8); x.lineTo(20, 7.0); x.lineTo(17.2, 7.8); x.closePath();
+    paint(x, LG(x, 0, 5.8, 0, 7.8, [[0, '#5a5a5a'], [1, '#1c1c1c']]), 0.45);
+    ellipse(x, 15.4, 6.0, 0.9, 0.9, '#ffffff', 0.3); ellipse(x, 15.6, 6.0, 0.5, 0.5, '#111111', 0);
+    x.beginPath();
+    if (f) { x.moveTo(6, 8); x.quadraticCurveTo(8, 0.8, 13.4, 2.4); x.quadraticCurveTo(11, 6, 10.6, 8.6); }
+    else { x.moveTo(6, 9.6); x.quadraticCurveTo(8, 15.6, 13, 14.2); x.quadraticCurveTo(11, 11.6, 10.6, 9.2); }
+    x.closePath(); paint(x, LG(x, 6, 0, 13, 0, [[0, '#2a2f38'], [1, '#0e0f12']]), 0.6);
+    x.strokeStyle = '#6b6b6b'; x.lineWidth = 0.45; x.beginPath(); x.moveTo(8.4, 12.2); x.lineTo(8.0, 14.6); x.moveTo(10.2, 12.2); x.lineTo(10.0, 14.6); x.stroke();
   });
 }
 
-/* ---- Pakistan flag (waving) ---- */
+/* ---- Pakistan flag (waving, shaded per column) ---- */
 function drawPkFlag(phase) {
   const w = 30, h = 20;
-  const flat = newCanvas(w, h);
-  const c = flat.getContext('2d');
-  c.fillStyle = '#ffffff'; c.fillRect(0, 0, 8, h);
-  c.fillStyle = '#01411c'; c.fillRect(8, 0, w - 8, h);
-  c.fillStyle = '#ffffff'; c.beginPath(); c.arc(19, 10, 6, 0, Math.PI * 2); c.fill();
-  c.fillStyle = '#01411c'; c.beginPath(); c.arc(21, 8.5, 5.2, 0, Math.PI * 2); c.fill();
-  c.fillStyle = '#ffffff'; c.beginPath();
-  for (let i = 0; i < 10; i++) {
-    const r = i % 2 ? 1.1 : 2.6, a = -Math.PI / 2 + i * Math.PI / 5 + 0.5;
-    const x = 23 + Math.cos(a) * r, y = 7 + Math.sin(a) * r;
-    i ? c.lineTo(x, y) : c.moveTo(x, y);
-  }
-  c.fill();
-  const out = newCanvas(w + 2, h + 6);
-  const o = out.getContext('2d');
-  for (let x = 0; x < w; x++) {
-    const off = Math.sin(phase + x * 0.32) * 2 * (x / w);
-    const lit = Math.cos(phase + x * 0.32);
-    o.drawImage(flat, x, 0, 1, h, x, 3 + off, 1, h);
-    o.fillStyle = lit > 0 ? `rgba(255,255,255,${lit * 0.12})` : `rgba(0,0,0,${-lit * 0.18})`;
-    o.fillRect(x, 3 + off, 1, h);
-  }
-  return out;
+  const flat = hiArt(w, h, x => {
+    x.fillStyle = '#ffffff'; x.fillRect(0, 0, 7.5, h);
+    x.fillStyle = '#01411c'; x.fillRect(7.5, 0, w - 7.5, h);
+    x.fillStyle = '#ffffff'; x.beginPath(); x.arc(19, 10, 6, 0, Math.PI * 2); x.fill();
+    x.fillStyle = '#01411c'; x.beginPath(); x.arc(21, 8.5, 5.2, 0, Math.PI * 2); x.fill();
+    x.fillStyle = '#ffffff'; x.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const r = i % 2 ? 1.1 : 2.6, a = -Math.PI / 2 + i * Math.PI / 5 + 0.5;
+      const px = 23 + Math.cos(a) * r, py = 7 + Math.sin(a) * r;
+      i ? x.lineTo(px, py) : x.moveTo(px, py);
+    }
+    x.fill();
+  });
+  return hiArt(w + 2, h + 6, o => {
+    o.setTransform(1, 0, 0, 1, 0, 0);
+    const cols = w * S;
+    for (let c = 0; c < cols; c++) {
+      const xw = c / S;
+      const off = Math.sin(phase + xw * 0.32) * 2 * (xw / w) * S;
+      const lt = Math.cos(phase + xw * 0.32);
+      o.drawImage(flat, c, 0, 1, h * S, c, 3 * S + off, 1, h * S);
+      o.fillStyle = lt > 0 ? `rgba(255,255,255,${lt * 0.16})` : `rgba(0,0,0,${-lt * 0.25})`;
+      o.fillRect(c, 3 * S + off, 1, h * S);
+    }
+  });
 }
 
 /* ---- level tiles + backgrounds, themed per world ---- */
 const THEMES = ['lahore', 'karachi', 'thar'];
 const themeOf = L => THEMES[(L.world - 1) % THEMES.length];
 
+/** a single bevelled brick/block: lit top-left edge, shadowed bottom-right edge */
+function bevelBlock(x, X, Y, W, H, col, depth = 0.8) {
+  x.fillStyle = LG(x, X, Y, X + W * 0.4, Y + H, [[0, lit(col, 0.12)], [1, lit(col, -0.08)]]);
+  x.fillRect(X, Y, W, H);
+  x.fillStyle = rgba('#ffffff', 0.3); x.fillRect(X, Y, W, depth * 0.6); x.fillRect(X, Y, depth * 0.5, H);
+  x.fillStyle = rgba('#000000', 0.28); x.fillRect(X, Y + H - depth * 0.6, W, depth * 0.6); x.fillRect(X + W - depth * 0.5, Y, depth * 0.5, H);
+}
+
 function drawTiles(scene, L) {
   const th = themeOf(L), id = L.id;
   const r = rng(L.world * 77);
   if (th === 'lahore') {
-    const brick = (R, y0, rows) => {
+    const bricks = (x, y0, rows) => {
       for (let row = 0; row < rows; row++) {
         const off = row % 2 ? 4 : 0;
-        for (let x = -off; x < 16; x += 8) {
-          const col = ['#a8462f', '#b5523a', '#9b3f2a', '#b84d33'][Math.floor(r() * 4)];
-          R(x, y0 + row * 4, 7, 3, col);
-          R(x, y0 + row * 4, 7, 1, shade(col, 0.15));
-        }
+        for (let bx = -off; bx < 16; bx += 8) bevelBlock(x, bx + 0.35, y0 + row * 4 + 0.35, 7.3, 3.3, ['#b4513a', '#c25d42', '#a84a34', '#bf5a3f'][Math.floor(r() * 4)]);
       }
     };
-    makeTex(scene, `gtop-${id}`, 16, 16, ctx => {
-      const R = painter(ctx);
-      R(0, 0, 16, 16, '#e7d3b0'); brick(R, 5, 3);
-      R(0, 0, 16, 4, '#d9b98a'); R(0, 0, 16, 1, '#f3e2c2'); R(0, 4, 16, 1, '#8c6b46');
+    makeTex(scene, `gtop-${id}`, 16, 16, x => {
+      x.fillStyle = '#e3cfa9'; x.fillRect(0, 0, 16, 16); bricks(x, 5, 3);
+      x.fillStyle = LG(x, 0, 0, 0, 5, [[0, '#f7e6c4'], [0.45, '#e2c391'], [1, '#b8915c']]); x.fillRect(0, 0, 16, 5);   // stone cornice
+      x.fillStyle = rgba('#ffffff', 0.55); x.fillRect(0, 0, 16, 0.6);
+      x.fillStyle = rgba('#000000', 0.35); x.fillRect(0, 4.4, 16, 0.6);
+      x.fillStyle = rgba('#000000', 0.12); x.fillRect(0, 5, 16, 1.2);
     });
-    makeTex(scene, `gfill-${id}`, 16, 16, ctx => { const R = painter(ctx); R(0, 0, 16, 16, '#d8c3a0'); brick(R, 0, 4); });
-    makeTex(scene, `plat-${id}`, 16, 16, ctx => {            // carved wooden jharoka ledge
-      const R = painter(ctx);
-      R(0, 0, 16, 5, '#7b4a2a'); R(0, 0, 16, 1, '#b07a4e'); R(0, 4, 16, 1, '#4e2c17');
-      R(2, 5, 12, 2, '#6a3d22'); R(4, 7, 8, 2, '#5c3420'); R(6, 9, 4, 2, '#4e2c17'); R(7, 11, 2, 2, '#3e2212');
-      R(3, 1, 2, 2, '#e0a43a'); R(11, 1, 2, 2, '#e0a43a');
+    makeTex(scene, `gfill-${id}`, 16, 16, x => { x.fillStyle = '#d6c09a'; x.fillRect(0, 0, 16, 16); bricks(x, 0, 4); });
+    makeTex(scene, `plat-${id}`, 16, 16, x => {               // carved wooden jharoka ledge
+      x.fillStyle = LG(x, 0, 0, 0, 5.5, [[0, '#c48a5a'], [0.25, '#9a6236'], [1, '#5e3519']]); x.fillRect(0, 0, 16, 5.5);
+      x.fillStyle = rgba('#ffffff', 0.4); x.fillRect(0, 0, 16, 0.6);
+      x.fillStyle = rgba('#000000', 0.4); x.fillRect(0, 5.0, 16, 0.6);
+      x.beginPath(); x.moveTo(2, 5.5); x.lineTo(14, 5.5); x.quadraticCurveTo(11, 8, 9.2, 12.6); x.lineTo(6.8, 12.6); x.quadraticCurveTo(5, 8, 2, 5.5); x.closePath();
+      paint(x, LG(x, 2, 0, 14, 0, [[0, '#8a5530'], [0.5, '#6d3f22'], [1, '#4a2914']]), 0.5);
+      ellipse(x, 3.5, 2.6, 0.9, 0.9, sphere(x, 3.5, 2.6, 0.9, '#e0a43a'), 0.3);
+      ellipse(x, 12.5, 2.6, 0.9, 0.9, sphere(x, 12.5, 2.6, 0.9, '#e0a43a'), 0.3);
     });
   } else if (th === 'karachi') {
-    makeTex(scene, `gtop-${id}`, 16, 16, ctx => {
-      const R = painter(ctx);
-      R(0, 0, 16, 16, '#d8b978'); R(0, 0, 16, 5, '#f1dca6'); R(0, 0, 16, 1, '#fff2cc'); R(0, 5, 16, 2, '#c9a865');
-      for (let i = 0; i < 10; i++) R(Math.floor(r() * 16), 1 + Math.floor(r() * 14), 1, 1, r() > 0.5 ? '#b89558' : '#fff0c4');
-      if (r() > 0.4) { R(9, 10, 2, 1, '#f8bbd0'); R(9, 11, 2, 1, '#ec7fa6'); }
+    makeTex(scene, `gtop-${id}`, 16, 16, x => {
+      x.fillStyle = LG(x, 0, 0, 0, 16, [[0, '#fff3d0'], [0.3, '#f1d9a0'], [0.4, '#d9b978'], [1, '#c9a564']]); x.fillRect(0, 0, 16, 16);
+      x.fillStyle = rgba('#ffffff', 0.6); x.fillRect(0, 0, 16, 0.6);
+      x.strokeStyle = rgba('#c49a55', 0.6); x.lineWidth = 0.4;
+      for (let i = 0; i < 3; i++) { x.beginPath(); x.moveTo(r() * 6, 1.5 + i * 1.2); x.quadraticCurveTo(8, 1 + i * 1.2, 10 + r() * 6, 1.6 + i * 1.2); x.stroke(); }
+      for (let i = 0; i < 14; i++) ellipse(x, r() * 16, 6 + r() * 10, 0.3, 0.3, r() > 0.5 ? '#b08a4a' : '#fff0c4', 0);
+      if (r() > 0.3) { x.save(); x.translate(10, 11); x.rotate(0.4); ellipse(x, 0, 0, 1.4, 1.0, sphere(x, 0, 0, 1.4, '#f48fb1'), 0.3); x.restore(); }
     });
-    makeTex(scene, `gfill-${id}`, 16, 16, ctx => {
-      const R = painter(ctx);
-      R(0, 0, 16, 16, '#c9a865'); R(0, 6, 16, 4, '#bd9a59');
-      for (let i = 0; i < 8; i++) R(Math.floor(r() * 16), Math.floor(r() * 16), 1, 1, r() > 0.5 ? '#a98748' : '#dcc189');
+    makeTex(scene, `gfill-${id}`, 16, 16, x => {
+      x.fillStyle = '#c9a564'; x.fillRect(0, 0, 16, 16);
+      x.fillStyle = rgba('#000000', 0.07); x.fillRect(0, 6, 16, 4);
+      x.fillStyle = rgba('#ffffff', 0.08); x.fillRect(0, 12, 16, 2);
+      for (let i = 0; i < 12; i++) ellipse(x, r() * 16, r() * 16, 0.32, 0.32, r() > 0.5 ? '#a98748' : '#e2c891', 0);
     });
-    makeTex(scene, `plat-${id}`, 16, 16, ctx => {            // truck-art painted board
-      const R = painter(ctx);
-      R(0, 0, 16, 7, '#00897b'); R(0, 0, 16, 1, '#4db6ac'); R(0, 2, 16, 1, '#fdd835'); R(0, 5, 16, 1, '#e53935');
-      R(3, 3, 2, 2, '#ffffff'); R(11, 3, 2, 2, '#ffffff'); R(7, 3, 2, 2, '#f06292'); R(0, 6, 16, 1, '#004d40');
-      R(2, 7, 2, 6, '#6d4c41'); R(12, 7, 2, 6, '#6d4c41');
+    makeTex(scene, `plat-${id}`, 16, 16, x => {               // glossy truck-art painted board
+      rrect(x, 0, 0, 16, 6.6, 0.6);
+      x.fillStyle = LG(x, 0, 0, 0, 6.6, [[0, '#26a69a'], [1, '#00695c']]); x.fill();
+      x.fillStyle = '#fdd835'; x.fillRect(0, 1.6, 16, 0.8);
+      x.fillStyle = '#e53935'; x.fillRect(0, 4.6, 16, 0.8);
+      [[3.5, '#ffffff'], [8, '#f06292'], [12.5, '#ffffff']].forEach(([cx, c]) => ellipse(x, cx, 3.3, 0.9, 0.9, sphere(x, cx, 3.3, 0.9, c), 0.25));
+      x.fillStyle = rgba('#ffffff', 0.35); x.fillRect(0, 0, 16, 0.7);
+      x.fillStyle = rgba('#000000', 0.35); x.fillRect(0, 6.0, 16, 0.6);
+      [[2.4], [12.4]].forEach(([px]) => { x.fillStyle = LG(x, px, 0, px + 1.8, 0, [[0, '#8d6e63'], [1, '#4e342e']]); x.fillRect(px, 6.6, 1.8, 6); });
     });
   } else {
-    makeTex(scene, `gtop-${id}`, 16, 16, ctx => {
-      const R = painter(ctx);
-      R(0, 0, 16, 16, '#c99a5b'); R(0, 0, 16, 5, '#f0c98a'); R(0, 0, 16, 1, '#ffe2ae');
-      R(2, 2, 5, 1, '#dcae6c'); R(9, 3, 6, 1, '#dcae6c'); R(0, 5, 16, 1, '#a87a42');
-      R(0, 10, 16, 1, '#a87a42'); R(7, 6, 1, 4, '#a87a42');
+    makeTex(scene, `gtop-${id}`, 16, 16, x => {
+      x.fillStyle = '#c08f52'; x.fillRect(0, 0, 16, 16);
+      x.fillStyle = LG(x, 0, 0, 0, 5, [[0, '#ffe3ad'], [1, '#e2b06c']]); x.fillRect(0, 0, 16, 5);
+      x.strokeStyle = rgba('#b88446', 0.7); x.lineWidth = 0.4;
+      x.beginPath(); x.moveTo(0, 2); x.quadraticCurveTo(8, 1.2, 16, 2); x.moveTo(0, 3.6); x.quadraticCurveTo(8, 2.8, 16, 3.6); x.stroke();
+      x.fillStyle = rgba('#000000', 0.25); x.fillRect(0, 5, 16, 0.7);
+      bevelBlock(x, 0.3, 6, 7.4, 4.7, '#c99558'); bevelBlock(x, 8.3, 6, 7.4, 4.7, '#bf8c4f');
+      bevelBlock(x, -3.7, 11.2, 7.4, 4.5, '#c49152'); bevelBlock(x, 4.3, 11.2, 7.4, 4.5, '#cc9a5c'); bevelBlock(x, 12.3, 11.2, 7.4, 4.5, '#c49152');
     });
-    makeTex(scene, `gfill-${id}`, 16, 16, ctx => {
-      const R = painter(ctx);
-      R(0, 0, 16, 16, '#c08f52'); R(0, 7, 16, 1, '#9c6f3a'); R(0, 15, 16, 1, '#9c6f3a');
-      R(4, 0, 1, 7, '#9c6f3a'); R(12, 8, 1, 7, '#9c6f3a'); R(1, 1, 3, 1, '#d4a566'); R(6, 9, 4, 1, '#d4a566');
-      if (r() > 0.5) R(9, 3, 2, 1, '#8a6232');
+    makeTex(scene, `gfill-${id}`, 16, 16, x => {
+      x.fillStyle = '#a87a42'; x.fillRect(0, 0, 16, 16);
+      bevelBlock(x, 0.3, 0.3, 7.4, 7.4, '#c49152', 1); bevelBlock(x, 8.3, 0.3, 7.4, 7.4, '#bb894c', 1);
+      bevelBlock(x, -3.7, 8.3, 7.4, 7.4, '#bf8c4f', 1); bevelBlock(x, 4.3, 8.3, 7.4, 7.4, '#c99558', 1); bevelBlock(x, 12.3, 8.3, 7.4, 7.4, '#bf8c4f', 1);
     });
-    makeTex(scene, `plat-${id}`, 16, 16, ctx => {            // ancient baked-brick slab
-      const R = painter(ctx);
-      R(0, 0, 16, 8, '#b8693f'); R(0, 0, 16, 1, '#d98b5f'); R(0, 4, 16, 1, '#8c4a28'); R(0, 7, 16, 1, '#7a3f22');
-      R(5, 1, 1, 3, '#8c4a28'); R(12, 5, 1, 2, '#8c4a28'); R(2, 8, 3, 2, '#9c5631'); R(10, 8, 4, 3, '#9c5631');
+    makeTex(scene, `plat-${id}`, 16, 16, x => {               // ancient baked-brick slab
+      bevelBlock(x, 0.2, 0.2, 7.6, 3.6, '#c4703f'); bevelBlock(x, 8.2, 0.2, 7.6, 3.6, '#b8663a');
+      bevelBlock(x, -3.8, 4.2, 7.6, 3.6, '#ad5e34'); bevelBlock(x, 4.2, 4.2, 7.6, 3.6, '#c4703f'); bevelBlock(x, 12.2, 4.2, 7.6, 3.6, '#ad5e34');
+      x.beginPath(); x.moveTo(3, 8); x.lineTo(13, 8); x.lineTo(11, 10.6); x.lineTo(5, 10.6); x.closePath();
+      paint(x, LG(x, 0, 8, 0, 10.6, [[0, '#8c4a28'], [1, '#5e2f17']]), 0.4);
     });
   }
 }
 
 /* silhouettes used by the backgrounds */
-function drawPalm(R, x, y, s = 1) {
-  for (let i = 0; i < 34 * s; i++) R(x + Math.round(Math.sin(i / 14) * 4), y - i, 3, 1, i % 4 ? '#7b5a3a' : '#5d4128');
-  const tx = x + Math.round(Math.sin(34 * s / 14) * 4), ty = y - 34 * s;
-  [[-14, 4], [-10, 8], [12, 5], [9, 9], [0, -4], [-4, 10]].forEach(([dx, dy]) => {
-    for (let i = 0; i <= 10; i++) {
-      const t = i / 10;
-      R(tx + dx * t, ty + dy * t * t - 2, 3, 2, t > 0.6 ? '#2e7d32' : '#388e3c');
-    }
+function drawPalm(x, px, py, s = 1) {
+  x.beginPath(); x.moveTo(px - 1.6, py);
+  x.quadraticCurveTo(px + 5 * s, py - 18 * s, px + 2 * s, py - 34 * s);
+  x.lineTo(px + 4.2 * s, py - 34 * s); x.quadraticCurveTo(px + 7.4 * s, py - 18 * s, px + 1.6, py); x.closePath();
+  paint(x, LG(x, px - 2, 0, px + 7 * s, 0, [[0, '#a07850'], [0.5, '#7b5a3a'], [1, '#4e3620']]), 0.6);
+  const tx = px + 3 * s, ty = py - 34 * s;
+  [[-15, 5], [-11, 10], [13, 6], [10, 11], [1, -6], [-5, 12], [5, 13]].forEach(([dx, dy], i) => {
+    x.beginPath(); x.moveTo(tx, ty);
+    x.quadraticCurveTo(tx + dx * 0.5 * s, ty + dy * 0.2 * s - 6 * s, tx + dx * s, ty + dy * s);
+    x.quadraticCurveTo(tx + dx * 0.45 * s, ty + dy * 0.3 * s - 2.4 * s, tx, ty + 1.6 * s);
+    paint(x, LG(x, tx, ty - 6 * s, tx + dx * s, ty + dy * s, [[0, '#66bb6a'], [1, i % 2 ? '#1b5e20' : '#2e7d32']]), 0.5);
   });
+  ellipse(x, tx, ty + 1, 2 * s, 1.6 * s, sphere(x, tx, ty + 1, 2 * s, '#795548'), 0.4);
 }
-function drawCamel(R, x, y, col) {
-  R(x, y - 12, 18, 6, col); R(x + 4, y - 15, 6, 3, col); R(x + 16, y - 20, 3, 10, col);
-  R(x + 16, y - 22, 6, 3, col);
-  [1, 5, 12, 15].forEach(dx => R(x + dx, y - 6, 2, 6, col));
-  R(x + 3, y - 12, 12, 2, '#c62828'); R(x + 3, y - 10, 2, 2, '#fdd835');   // decorated saddle
+function drawCamel(x, px, py, col) {
+  x.beginPath();
+  x.moveTo(px, py - 8); x.quadraticCurveTo(px + 2, py - 15, px + 6, py - 16); x.quadraticCurveTo(px + 10, py - 18, px + 13, py - 13);
+  x.lineTo(px + 16.5, py - 13); x.lineTo(px + 17, py - 21); x.quadraticCurveTo(px + 19, py - 24, px + 22.5, py - 21.5);
+  x.lineTo(px + 22.5, py - 20); x.lineTo(px + 19.2, py - 19.6); x.lineTo(px + 19, py - 11); x.quadraticCurveTo(px + 18, py - 7, px + 15, py - 7);
+  x.lineTo(px + 3, py - 7); x.closePath();
+  paint(x, LG(x, 0, py - 22, 0, py - 6, [[0, lit(col, 0.25)], [1, lit(col, -0.25)]]), 0.6);
+  [1.2, 4.2, 12, 15].forEach(dx => limb(x, px + dx, py - 7.5, px + dx + 0.3, py - 0.5, 1.4, lit(col, -0.1)));
+  rrect(x, px + 3.4, py - 15, 10.6, 3, 1); paint(x, LG(x, 0, py - 15, 0, py - 12, [[0, '#ef5350'], [1, '#b71c1c']]), 0.5);
+  for (let i = 0; i < 5; i++) ellipse(x, px + 4.6 + i * 2.1, py - 11.6, 0.5, 0.5, '#fdd835', 0.2);
 }
-function drawKikar(R, x, y, col) {
-  R(x, y - 20, 2, 20, col);
-  R(x - 3, y - 18, 2, 2, col); R(x + 3, y - 16, 2, 2, col);
-  R(x - 12, y - 24, 26, 4, shade(col, 0.1)); R(x - 8, y - 27, 18, 3, shade(col, 0.15));
+function drawKikar(x, px, py, col) {
+  limb(x, px, py, px + 0.6, py - 18, 1.8, '#5d4630');
+  limb(x, px + 0.4, py - 12, px - 5, py - 19, 1, '#5d4630');
+  limb(x, px + 0.5, py - 14, px + 6, py - 20, 1, '#5d4630');
+  x.beginPath(); x.ellipse(px, py - 22, 14, 3.6, 0, 0, Math.PI * 2);
+  paint(x, LG(x, 0, py - 26, 0, py - 18.5, [[0, lit(col, 0.3)], [1, lit(col, -0.3)]]), 0.6);
+  x.beginPath(); x.ellipse(px + 1, py - 25, 9, 2.6, 0, 0, Math.PI * 2);
+  paint(x, LG(x, 0, py - 28, 0, py - 22.5, [[0, lit(col, 0.45)], [1, col]]), 0.5);
+}
+/** 3D building: front face, darker side face and a lit roof */
+function building(x, bx, by, bw, bh, col, depth = 5) {
+  x.beginPath(); x.moveTo(bx + bw, by); x.lineTo(bx + bw + depth, by - depth * 0.6); x.lineTo(bx + bw + depth, by + bh); x.lineTo(bx + bw, by + bh); x.closePath();
+  paint(x, LG(x, bx + bw, 0, bx + bw + depth, 0, [[0, lit(col, -0.3)], [1, lit(col, -0.42)]]), 0.5);
+  x.beginPath(); x.moveTo(bx, by); x.lineTo(bx + depth, by - depth * 0.6); x.lineTo(bx + bw + depth, by - depth * 0.6); x.lineTo(bx + bw, by); x.closePath();
+  paint(x, lit(col, 0.28), 0.5);
+  x.beginPath(); x.rect(bx, by, bw, bh);
+  paint(x, LG(x, bx, by, bx + bw, by + bh, [[0, lit(col, 0.14)], [1, lit(col, -0.1)]]), 0.5);
 }
 
 function buildLevelArt(scene, L) {
@@ -648,126 +762,171 @@ function buildLevelArt(scene, L) {
   if (scene.textures.exists(`sky-${id}`)) return;
   drawTiles(scene, L);
   const r = rng(L.world * 131);
+  const skyTop = th === 'thar' ? '#f2a65a' : th === 'karachi' ? '#3d8fd1' : '#5a8fc8';
+  const skyBot = th === 'thar' ? '#fff0c8' : th === 'karachi' ? '#cdeefc' : '#fbe8c8';
+  const haze = th === 'thar' ? '#ffe2b0' : th === 'karachi' ? '#d8f1fb' : '#f5dcc0';
 
-  // sky: banded gradient (pixel-art style)
-  makeTex(scene, `sky-${id}`, GAME_WIDTH, CAM_H, (c, w, h) => {
-    const topC = mix(L.sky, '#2b4c7e', th === 'thar' ? 0.15 : 0.45);
-    const botC = mix(L.sky, '#fff3d6', 0.55);
-    for (let y = 0; y < h; y += 4) { c.fillStyle = mix(topC, botC, Math.pow(y / h, 1.3)); c.fillRect(0, y, w, 4); }
+  makeTex(scene, `sky-${id}`, GAME_WIDTH, CAM_H, (x, w, h) => {
+    x.fillStyle = LG(x, 0, 0, 0, h, [[0, skyTop], [0.65, mix(skyTop, skyBot, 0.7)], [1, skyBot]]); x.fillRect(0, 0, w, h);
+    x.globalCompositeOperation = 'lighter';                     // soft sun rays
+    for (let i = 0; i < 6; i++) {
+      x.beginPath(); x.moveTo(400, 40);
+      const a = 1.95 + i * 0.24, len = 260;
+      x.lineTo(400 + Math.cos(a) * len, 40 + Math.sin(a) * len); x.lineTo(400 + Math.cos(a + 0.06) * len, 40 + Math.sin(a + 0.06) * len); x.closePath();
+      x.fillStyle = LG(x, 400, 40, 400 + Math.cos(a) * len, 40 + Math.sin(a) * len, [[0, 'rgba(255,240,200,0.10)'], [1, 'rgba(255,240,200,0)']]); x.fill();
+    }
+    x.globalCompositeOperation = 'source-over';
   });
 
+  const hazeOver = (x, w, h, a) => { x.fillStyle = LG(x, 0, 0, 0, h, [[0, rgba(haze, 0)], [1, rgba(haze, a)]]); x.fillRect(0, 0, w, h); };
+
   if (th === 'lahore') {
-    makeTex(scene, `far-${id}`, 480, 150, (c, w, h) => {
-      const R = painter(c), col = '#a596c4', dk = '#8e7fb0';
-      for (let x = 0; x < w; x += 12) R(x, h - 14 - Math.floor(r() * 14), 12, 40, col);
-      // Minar-e-Pakistan
-      const mx = 330, base = h - 14;
-      R(mx - 26, base - 6, 52, 8, col); R(mx - 18, base - 12, 36, 6, col);
-      for (let y = 0; y < 110; y++) { const half = Math.round(8 - (y / 110) * 5); R(mx - half, base - 12 - y, half * 2, 1, col); }
-      [30, 62, 92].forEach(y => R(mx - 8, base - 12 - y, 16, 3, dk));
-      c.fillStyle = col; c.beginPath(); c.arc(mx, base - 123, 5, Math.PI, 0); c.fill();
-      R(mx, base - 134, 1, 8, col);
-      // Mughal-style monument with domes and minarets
+    makeTex(scene, `far-${id}`, 480, 150, (x, w, h) => {
+      const col = '#9d8fc2', dk = '#857aaa', base = h - 14;
+      x.fillStyle = LG(x, 0, base - 30, 0, h, [[0, lit(col, 0.1)], [1, col]]);
+      for (let bx = 0; bx < w; bx += 12) x.fillRect(bx, h - 14 - Math.floor(r() * 14), 12, 40);
+      // Minar-e-Pakistan: cylinder shading
+      const mx = 330;
+      const cyl = (yTop, hgt, half) => { x.fillStyle = LG(x, mx - half, 0, mx + half, 0, [[0, lit(col, 0.25)], [0.4, col], [1, dk]]); x.fillRect(mx - half, yTop, half * 2, hgt); };
+      x.fillStyle = LG(x, mx - 26, 0, mx + 26, 0, [[0, lit(col, 0.2)], [1, dk]]); x.fillRect(mx - 26, base - 6, 52, 8); x.fillRect(mx - 18, base - 12, 36, 6);
+      for (let y = 0; y < 110; y += 2) cyl(base - 12 - y - 2, 2.2, 8 - (y / 110) * 5);
+      [30, 62, 92].forEach(y => cyl(base - 12 - y - 3, 3, 8.5 - (y / 110) * 5));
+      x.beginPath(); x.arc(mx, base - 123, 5, Math.PI, 0); x.fillStyle = RG(x, mx, base - 124, 5, [[0, lit(col, 0.35)], [1, col]], mx - 2, base - 126, 0.3); x.fill();
+      x.fillStyle = col; x.fillRect(mx - 0.5, base - 134, 1, 8);
+      // Mughal-style monument
       const fx = 110;
-      R(fx - 40, base - 30, 80, 30, col);
-      for (let i = -3; i <= 3; i++) { R(fx + i * 10 - 3, base - 22, 6, 16, dk); c.fillStyle = dk; c.beginPath(); c.arc(fx + i * 10, base - 22, 3, Math.PI, 0); c.fill(); }
-      c.fillStyle = col; c.beginPath(); c.ellipse(fx, base - 44, 17, 16, 0, Math.PI, 0); c.fill();
-      R(fx - 15, base - 44, 30, 14, col); R(fx, base - 66, 1, 8, col);
-      [-28, 28].forEach(dx => { c.beginPath(); c.arc(fx + dx, base - 36, 6, Math.PI, 0); c.fill(); R(fx + dx - 5, base - 36, 10, 6, col); });
-      [-44, 44].forEach(dx => { R(fx + dx - 3, base - 72, 6, 72, col); c.beginPath(); c.arc(fx + dx, base - 72, 4, Math.PI, 0); c.fill(); R(fx + dx - 4, base - 52, 8, 2, dk); });
+      x.fillStyle = LG(x, fx - 40, 0, fx + 40, 0, [[0, lit(col, 0.15)], [1, dk]]); x.fillRect(fx - 40, base - 30, 80, 30);
+      for (let i = -3; i <= 3; i++) { x.fillStyle = dk; x.fillRect(fx + i * 10 - 3, base - 22, 6, 16); x.beginPath(); x.arc(fx + i * 10, base - 22, 3, Math.PI, 0); x.fill(); }
+      x.beginPath(); x.ellipse(fx, base - 44, 17, 16, 0, Math.PI, 0); x.fillStyle = RG(x, fx, base - 46, 18, [[0, lit(col, 0.35)], [1, col]], fx - 6, base - 54, 1); x.fill();
+      x.fillStyle = col; x.fillRect(fx - 15, base - 44, 30, 14); x.fillRect(fx - 0.5, base - 66, 1, 8);
+      [-28, 28].forEach(dx => { x.beginPath(); x.arc(fx + dx, base - 36, 6, Math.PI, 0); x.fillStyle = RG(x, fx + dx, base - 37, 6, [[0, lit(col, 0.3)], [1, col]], fx + dx - 2, base - 40, 0.2); x.fill(); x.fillStyle = col; x.fillRect(fx + dx - 5, base - 36, 10, 6); });
+      [-44, 44].forEach(dx => { x.fillStyle = LG(x, fx + dx - 3, 0, fx + dx + 3, 0, [[0, lit(col, 0.2)], [1, dk]]); x.fillRect(fx + dx - 3, base - 72, 6, 72); x.beginPath(); x.arc(fx + dx, base - 72, 4, Math.PI, 0); x.fill(); x.fillStyle = dk; x.fillRect(fx + dx - 4, base - 52, 8, 2); });
+      hazeOver(x, w, h, 0.55);
     });
-    makeTex(scene, `mid-${id}`, 480, 110, (c, w, h) => {
-      const R = painter(c);
-      const cols = ['#c9785d', '#d9a066', '#b5655a', '#e0b98a', '#c98d6b', '#a8634f'];
-      let x = 0;
-      while (x < w) {
-        let bw = 36 + Math.floor(r() * 34);
-        if (w - x - bw < 30) bw = w - x;
-        const bh = 40 + Math.floor(r() * 50), col = cols[Math.floor(r() * cols.length)];
-        const y0 = h - bh;
-        R(x, y0, bw, bh, col); R(x + bw - 3, y0, 3, bh, shade(col, -0.15)); R(x, y0, bw, 2, shade(col, 0.2));
-        for (let cx = x + 2; cx < x + bw - 3; cx += 6) R(cx, y0 - 3, 3, 3, col);       // parapet
+    makeTex(scene, `mid-${id}`, 480, 110, (x, w, h) => {
+      const cols = ['#d4805f', '#e4aa6c', '#c06a5c', '#e8c08e', '#d39470', '#b86b54', '#e59a74'];
+      let bx = 0;
+      while (bx < w) {
+        let bw = 34 + Math.floor(r() * 32);
+        if (w - bx - bw < 30) bw = w - bx - 5;
+        const bh = 40 + Math.floor(r() * 50), col = cols[Math.floor(r() * cols.length)], y0 = h - bh;
+        building(x, bx, y0, bw, bh + 2, col, 5);
+        for (let cx = bx + 2; cx < bx + bw - 3; cx += 6) { x.fillStyle = lit(col, 0.12); x.fillRect(cx, y0 - 3, 3, 3); }
         for (let wy = y0 + 8; wy < h - 10; wy += 16)
-          for (let wx = x + 6; wx < x + bw - 10; wx += 12) {
-            const lit = r() > 0.75;
-            R(wx, wy + 2, 6, 8, lit ? '#ffcc66' : '#4a2f2a'); R(wx + 1, wy, 4, 2, lit ? '#ffcc66' : '#4a2f2a');
-            R(wx - 1, wy + 10, 8, 1, shade(col, 0.25));
+          for (let wx = bx + 6; wx < bx + bw - 10; wx += 12) {
+            const on = r() > 0.72;
+            x.beginPath(); x.moveTo(wx, wy + 10); x.lineTo(wx, wy + 3); x.arc(wx + 3, wy + 3, 3, Math.PI, 0); x.lineTo(wx + 6, wy + 10); x.closePath();
+            x.fillStyle = on ? RG(x, wx + 3, wy + 6, 6, [[0, '#fff2b0'], [1, '#f2a93b']]) : LG(x, 0, wy, 0, wy + 10, [[0, '#2b1b18'], [1, '#4f342c']]);
+            x.fill(); x.lineWidth = 0.6; x.strokeStyle = lit(col, 0.3); x.stroke();
+            x.fillStyle = lit(col, -0.25); x.fillRect(wx - 1, wy + 10, 8, 1.2);
           }
-        if (bw > 44 && r() > 0.35) {                                                    // jharoka balcony
-          const jx = x + Math.floor(bw / 2) - 8, jy = y0 + 18;
-          R(jx, jy, 16, 12, '#6d4128'); R(jx + 2, jy + 2, 12, 7, '#3b2418'); R(jx - 1, jy + 12, 18, 2, '#8a5636');
-          c.fillStyle = '#8a5636'; c.beginPath(); c.arc(jx + 8, jy, 8, Math.PI, 0); c.fill();
+        if (bw > 44 && r() > 0.35) {                                       // jharoka balcony (3D box + dome)
+          const jx = bx + Math.floor(bw / 2) - 8, jy = y0 + 18;
+          rrect(x, jx, jy, 16, 12, 1); paint(x, LG(x, jx, 0, jx + 16, 0, [[0, '#9a6236'], [1, '#5e3519']]), 0.5);
+          rrect(x, jx + 2.5, jy + 2.5, 11, 6.5, 0.5); paint(x, '#2e1c12', 0);
+          rrect(x, jx - 1.5, jy + 12, 19, 2.4, 0.6); paint(x, '#b07a4e', 0.4);
+          x.beginPath(); x.arc(jx + 8, jy, 8, Math.PI, 0); paint(x, RG(x, jx + 8, jy - 1, 8, [[0, '#c48a5a'], [1, '#6d3f22']], jx + 5, jy - 5, 0.5), 0.5);
         }
-        if (r() > 0.5) { R(x + 6, y0 - 9, 8, 7, '#2f3b40'); R(x + 6, y0 - 9, 8, 1, '#4f5f66'); } // water tank
-        x += bw;
+        if (r() > 0.5) { rrect(x, bx + 6, y0 - 10, 9, 8, 1.5); paint(x, LG(x, bx + 6, 0, bx + 15, 0, [[0, '#5f6e75'], [1, '#2f3b40']]), 0.4); }  // water tank
+        bx += bw + 5;
       }
+      hazeOver(x, w, h, 0.12);
     });
   } else if (th === 'karachi') {
-    makeTex(scene, `far-${id}`, 480, 150, (c, w, h) => {
-      const R = painter(c), col = '#86a3bd';
-      for (let x = 0; x < w;) {
+    makeTex(scene, `far-${id}`, 480, 150, (x, w, h) => {
+      const col = '#8eabc6';
+      for (let bx = 0; bx < w;) {
         const bw = 14 + Math.floor(r() * 18), bh = 30 + Math.floor(r() * 70);
-        if (x + bw > 300 && x < 420) { x = 420; continue; }
-        R(x, h - bh, Math.min(bw, w - x), bh, col);
-        for (let wy = h - bh + 4; wy < h - 4; wy += 5) for (let wx = x + 2; wx < x + bw - 2; wx += 4) if (r() > 0.4) R(wx, wy, 2, 2, '#a9c2d6');
-        x += bw + 2;
+        if (bx + bw > 300 && bx < 420) { bx = 420; continue; }
+        const ww = Math.min(bw, w - bx - 4);
+        building(x, bx, h - bh, ww, bh, col, 3);
+        x.fillStyle = 'rgba(220,240,255,0.55)';
+        for (let wy = h - bh + 4; wy < h - 4; wy += 5) for (let wx = bx + 2; wx < bx + ww - 2; wx += 4) if (r() > 0.45) x.fillRect(wx, wy, 2, 2.4);
+        bx += bw + 4;
       }
-      // Mazar-e-Quaid
-      const mx = 360, white = '#eef3f6';
-      R(mx - 30, h - 34, 60, 34, white); R(mx - 30, h - 34, 60, 2, '#ffffff');
-      R(mx - 7, h - 26, 14, 20, '#9fb3c2'); c.fillStyle = '#9fb3c2'; c.beginPath(); c.arc(mx, h - 26, 7, Math.PI, 0); c.fill();
-      c.fillStyle = white; c.beginPath(); c.moveTo(mx - 22, h - 34); c.quadraticCurveTo(mx - 20, h - 74, mx, h - 76);
-      c.quadraticCurveTo(mx + 20, h - 74, mx + 22, h - 34); c.fill();
-      R(mx - 34, h - 4, 68, 4, '#c7d3dc');
+      // Mazar-e-Quaid: white marble, curved dome
+      const mx = 360;
+      x.fillStyle = LG(x, mx - 30, 0, mx + 30, 0, [[0, '#ffffff'], [0.6, '#e8eef2'], [1, '#b9c7d2']]); x.fillRect(mx - 30, h - 34, 60, 34);
+      x.beginPath(); x.moveTo(mx - 7, h - 6); x.lineTo(mx - 7, h - 26); x.arc(mx, h - 26, 7, Math.PI, 0); x.lineTo(mx + 7, h - 6); x.closePath();
+      x.fillStyle = LG(x, 0, h - 33, 0, h - 6, [[0, '#7d93a6'], [1, '#a7b8c6']]); x.fill();
+      x.beginPath(); x.moveTo(mx - 22, h - 34); x.quadraticCurveTo(mx - 20, h - 74, mx, h - 76); x.quadraticCurveTo(mx + 20, h - 74, mx + 22, h - 34); x.closePath();
+      x.fillStyle = RG(x, mx, h - 50, 30, [[0, '#ffffff'], [0.6, '#eef3f6'], [1, '#aebfcc']], mx - 8, h - 66, 2); x.fill();
+      x.fillStyle = '#c7d3dc'; x.fillRect(mx - 34, h - 4, 68, 4);
+      hazeOver(x, w, h, 0.45);
     });
-    makeTex(scene, `mid-${id}`, 480, 84, (c, w, h) => {
-      const R = painter(c), top = 14;
-      for (let y = top; y < h; y += 3) R(0, y, w, 3, mix('#5bb0d6', '#1f6f99', (y - top) / (h - top)));
-      R(0, top, w, 2, '#bfe6f5');
-      for (let i = 0; i < 70; i++) { const x = Math.floor(r() * w), y = top + 6 + Math.floor(r() * (h - top - 10)); R(x, y, 4 + Math.floor(r() * 6), 1, 'rgba(255,255,255,0.55)'); }
-      // cargo ship on the horizon
-      R(140, top - 3, 34, 5, '#37474f'); R(142, top - 1, 30, 1, '#c62828');
-      R(150, top - 9, 14, 6, '#eceff1'); R(158, top - 14, 3, 5, '#e53935');
+    makeTex(scene, `mid-${id}`, 480, 84, (x, w, h) => {
+      const top = 14;
+      x.fillStyle = LG(x, 0, top, 0, h, [[0, '#7fd0ec'], [0.15, '#47a9d4'], [1, '#155f8c']]); x.fillRect(0, top, w, h - top);
+      x.fillStyle = 'rgba(255,255,255,0.75)'; x.fillRect(0, top, w, 1);
+      for (let i = 0; i < 90; i++) {
+        const wx = r() * w, wy = top + 4 + r() * (h - top - 8), len = 3 + r() * 8;
+        x.strokeStyle = `rgba(255,255,255,${0.25 + r() * 0.45})`; x.lineWidth = 0.6;
+        x.beginPath(); x.moveTo(wx, wy); x.quadraticCurveTo(wx + len / 2, wy - 1, wx + len, wy); x.stroke();
+      }
+      for (let i = 0; i < 25; i++) ellipse(x, r() * w, top + 3 + r() * 30, 0.6, 0.6, 'rgba(255,255,240,0.9)', 0);
+      // cargo ship
+      x.beginPath(); x.moveTo(138, top - 3); x.lineTo(176, top - 3); x.lineTo(172, top + 2); x.lineTo(142, top + 2); x.closePath();
+      paint(x, LG(x, 0, top - 3, 0, top + 2, [[0, '#546e7a'], [1, '#263238']]), 0.4);
+      x.fillStyle = '#c62828'; x.fillRect(141, top - 0.5, 32, 1);
+      rrect(x, 150, top - 9, 14, 6, 0.6); paint(x, LG(x, 150, 0, 164, 0, [[0, '#ffffff'], [1, '#b0bec5']]), 0.4);
+      rrect(x, 157.5, top - 14, 3, 5, 0.4); paint(x, '#e53935', 0.3);
     });
-    makeTex(scene, `near-${id}`, 480, 90, (c, w, h) => {
-      const R = painter(c);
-      drawPalm(R, 40, h, 1.4); drawPalm(R, 70, h, 1.1); drawPalm(R, 260, h, 1.5);
-      drawCamel(R, 330, h, '#8d6e4a');
+    makeTex(scene, `near-${id}`, 480, 90, (x, w, h) => {
+      drawPalm(x, 40, h, 1.4); drawPalm(x, 72, h, 1.1); drawPalm(x, 262, h, 1.5);
+      drawCamel(x, 326, h, '#a07850');
       [[150, '#e53935'], [400, '#1e88e5']].forEach(([ux, uc]) => {
-        R(ux, h - 30, 2, 30, '#5d4037');
-        for (let i = 0; i < 14; i++) R(ux - i, h - 32 + Math.floor(i / 3), i * 2 + 2, 1, i % 4 < 2 ? uc : '#ffffff');
+        limb(x, ux, h, ux, h - 30, 1.2, '#6d4c41');
+        x.beginPath(); x.moveTo(ux - 15, h - 27); x.quadraticCurveTo(ux, h - 40, ux + 15, h - 27); x.closePath();
+        x.save(); x.clip();
+        for (let i = -15; i < 15; i += 6) { x.fillStyle = (i / 6) % 2 ? uc : '#ffffff'; x.fillRect(ux + i, h - 42, 3, 16); x.fillStyle = (i / 6) % 2 ? '#ffffff' : uc; x.fillRect(ux + i + 3, h - 42, 3, 16); }
+        x.fillStyle = LG(x, ux - 15, 0, ux + 15, 0, [[0, 'rgba(255,255,255,0.25)'], [1, 'rgba(0,0,0,0.3)']]); x.fillRect(ux - 15, h - 42, 30, 16);
+        x.restore();
+        x.beginPath(); x.moveTo(ux - 15, h - 27); x.quadraticCurveTo(ux, h - 40, ux + 15, h - 27); x.closePath(); x.lineWidth = 0.6; x.strokeStyle = OUT; x.stroke();
       });
     });
   } else {
-    makeTex(scene, `far-${id}`, 480, 150, (c, w, h) => {
-      c.fillStyle = '#f5d3a1'; c.beginPath(); c.moveTo(0, h);
-      for (let x = 0; x <= w; x += 2) c.lineTo(x, h - 40 - Math.sin(x * Math.PI * 2 / 240) * 18 - Math.sin(x * Math.PI * 2 / 160 + 1) * 10);
-      c.lineTo(w, h); c.fill();
+    makeTex(scene, `far-${id}`, 480, 150, (x, w, h) => {
+      x.beginPath(); x.moveTo(0, h);
+      for (let px = 0; px <= w; px += 2) x.lineTo(px, h - 40 - Math.sin(px * Math.PI * 2 / 240) * 18 - Math.sin(px * Math.PI * 2 / 160 + 1) * 10);
+      x.lineTo(w, h); x.closePath();
+      x.fillStyle = LG(x, 0, h - 70, 0, h, [[0, '#f8d7a6'], [1, '#e8b47a']]); x.fill();
+      hazeOver(x, w, h, 0.45);
     });
-    makeTex(scene, `mid-${id}`, 480, 110, (c, w, h) => {
-      const R = painter(c);
-      c.fillStyle = '#e3ab6c'; c.beginPath(); c.moveTo(0, h);
-      for (let x = 0; x <= w; x += 2) c.lineTo(x, h - 26 - Math.sin(x * Math.PI * 2 / 480) * 14 - Math.sin(x * Math.PI * 2 / 96) * 4);
-      c.lineTo(w, h); c.fill();
+    makeTex(scene, `mid-${id}`, 480, 110, (x, w, h) => {
+      const dune = px => h - 26 - Math.sin(px * Math.PI * 2 / 480) * 14 - Math.sin(px * Math.PI * 2 / 96) * 4;
+      x.beginPath(); x.moveTo(0, h); for (let px = 0; px <= w; px += 2) x.lineTo(px, dune(px)); x.lineTo(w, h); x.closePath();
+      x.fillStyle = LG(x, 0, h - 45, 0, h, [[0, '#f0bd7c'], [1, '#d39557']]); x.fill();
+      for (let px = 0; px < w; px += 2) {                                 // shaded lee sides of the dunes
+        const slope = dune(px + 2) - dune(px);
+        if (slope > 0) { x.fillStyle = `rgba(150,80,30,${Math.min(0.28, slope * 0.3)})`; x.fillRect(px, dune(px), 2, h - dune(px)); }
+      }
       // Mohenjo-daro style mound + stupa
       const sx = 250, base = h - 22;
-      c.save();
-      c.fillStyle = '#b5653f'; c.beginPath(); c.moveTo(sx - 70, base); c.lineTo(sx - 40, base - 34); c.lineTo(sx + 40, base - 34); c.lineTo(sx + 70, base); c.closePath(); c.fill();
-      c.clip();
-      for (let y = base - 32; y < base; y += 4) { R(sx - 70, y, 140, 1, '#a35a37'); for (let x = sx - 70; x < sx + 70; x += 8) R(x + ((y / 4) % 2) * 4, y, 1, 4, '#94502f'); }
-      c.restore();
-      c.fillStyle = '#c47549'; c.beginPath(); c.arc(sx, base - 34, 18, Math.PI, 0); c.fill();
-      R(sx - 1, base - 58, 2, 6, '#94502f');
-      for (let i = 0; i < 6; i++) R(60 + i * 14, base - 6 - (i % 3) * 5, 10, 8 + (i % 3) * 5, '#b8693f');       // ruined walls
-      drawKikar(R, 410, base + 4, '#6b5b3a');
-      drawCamel(R, 140, base - 2, '#8a6440');
+      x.save();
+      x.beginPath(); x.moveTo(sx - 70, base); x.lineTo(sx - 40, base - 34); x.lineTo(sx + 40, base - 34); x.lineTo(sx + 70, base); x.closePath();
+      x.fillStyle = LG(x, sx - 70, 0, sx + 70, 0, [[0, '#d4835a'], [0.6, '#b5653f'], [1, '#8a4627']]); x.fill(); x.clip();
+      for (let y = base - 32; y < base; y += 4) {
+        x.fillStyle = 'rgba(80,30,10,0.35)'; x.fillRect(sx - 70, y, 140, 0.7);
+        for (let bx = sx - 70; bx < sx + 70; bx += 8) x.fillRect(bx + ((y / 4) % 2) * 4, y, 0.7, 4);
+      }
+      x.restore();
+      x.beginPath(); x.arc(sx, base - 34, 18, Math.PI, 0); x.fillStyle = RG(x, sx, base - 36, 19, [[0, '#e49a70'], [1, '#9c5230']], sx - 7, base - 46, 1); x.fill();
+      x.fillStyle = '#94502f'; x.fillRect(sx - 1, base - 58, 2, 6);
+      for (let i = 0; i < 6; i++) bevelBlock(x, 60 + i * 14, base - 6 - (i % 3) * 5, 10, 8 + (i % 3) * 5, '#c4703f', 1.2);
+      drawKikar(x, 410, base + 4, '#7b8a46');
+      drawCamel(x, 140, base - 2, '#a07850');
+      hazeOver(x, w, h, 0.1);
     });
-    makeTex(scene, `near-${id}`, 480, 60, (c, w, h) => {
-      const R = painter(c);
-      c.fillStyle = '#d29a58'; c.beginPath(); c.moveTo(0, h);
-      for (let x = 0; x <= w; x += 2) c.lineTo(x, h - 16 - Math.sin(x * Math.PI * 2 / 240 + 2) * 9);
-      c.lineTo(w, h); c.fill();
-      [70, 190, 330, 440].forEach(x => { R(x, h - 30, 3, 14, '#5f7a3a'); R(x - 3, h - 26, 3, 2, '#5f7a3a'); R(x - 3, h - 30, 2, 4, '#5f7a3a'); R(x + 3, h - 24, 3, 2, '#5f7a3a'); R(x + 5, h - 28, 2, 4, '#5f7a3a'); });
+    makeTex(scene, `near-${id}`, 480, 60, (x, w, h) => {
+      const dune = px => h - 16 - Math.sin(px * Math.PI * 2 / 240 + 2) * 9;
+      x.beginPath(); x.moveTo(0, h); for (let px = 0; px <= w; px += 2) x.lineTo(px, dune(px)); x.lineTo(w, h); x.closePath();
+      x.fillStyle = LG(x, 0, h - 26, 0, h, [[0, '#e6aa62'], [1, '#c4874a']]); x.fill();
+      [70, 190, 330, 440].forEach(cx => {                                 // cacti
+        const g = LG(x, cx - 1.6, 0, cx + 1.6, 0, [[0, '#8bc34a'], [1, '#33691e']]);
+        rrect(x, cx - 1.6, h - 30, 3.2, 16, 1.6); paint(x, g, 0.5);
+        rrect(x, cx - 5, h - 26, 2.4, 6, 1.2); paint(x, g, 0.5); rrect(x, cx - 5, h - 22, 4, 2, 1); paint(x, g, 0);
+        rrect(x, cx + 3, h - 28, 2.4, 6, 1.2); paint(x, g, 0.5); rrect(x, cx + 1.4, h - 23, 4, 2, 1); paint(x, g, 0);
+      });
     });
   }
 }
@@ -779,91 +938,121 @@ function buildTextures(scene) {
     for (let i = 0; i < HERO_FRAMES; i++) frames.push(drawHero(h.palette, HERO_STYLE[h.id] || {}, i));
     addSheet(scene, h.id, FW, FH, frames);
   });
-
   addSheet(scene, 'goon', 16, 16, [drawGoon(0), drawGoon(1)]);
   addSheet(scene, 'machhar', 16, 16, [drawMachhar(0), drawMachhar(1)]);
   addSheet(scene, 'kawwa', 20, 16, [drawKawwa(0), drawKawwa(1)]);
 
-  addImage(scene, 'jalebi', sprite(13, 13, R => {
-    const seen = new Set();
-    for (let t = 0; t < 2.3 * Math.PI * 2; t += 0.05) {
-      const rr = 0.6 + t * 0.36, x = Math.round(6 + Math.cos(t) * rr), y = Math.round(6 + Math.sin(t) * rr);
-      const k = x + ',' + y;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      R(x, y, 1, 1, t > 9 ? '#f39c12' : '#f7b733');
+  makeTex(scene, 'jalebi', 13, 13, x => {
+    const path = () => { x.beginPath(); for (let t = 0; t < 2.25 * Math.PI * 2; t += 0.08) { const rr = 0.7 + t * 0.36, px = 6.5 + Math.cos(t) * rr, py = 6.5 + Math.sin(t) * rr; t ? x.lineTo(px, py) : x.moveTo(px, py); } };
+    path(); x.strokeStyle = '#7a3300'; x.lineWidth = 2.5; x.stroke();
+    path(); x.strokeStyle = LG(x, 0, 0, 13, 13, [[0, '#ffcc5c'], [0.5, '#f39c12'], [1, '#d35400']]); x.lineWidth = 1.6; x.stroke();
+    path(); x.strokeStyle = 'rgba(255,255,220,0.55)'; x.lineWidth = 0.45; x.save(); x.translate(-0.35, -0.35); x.stroke(); x.restore();
+  });
+  makeTex(scene, 'star', 14, 14, x => {
+    const pts = [];
+    for (let i = 0; i < 10; i++) { const rr = i % 2 ? 2.9 : 6.4, a = (Math.PI / 5) * i - Math.PI / 2; pts.push([7 + Math.cos(a) * rr, 7.3 + Math.sin(a) * rr]); }
+    x.beginPath(); pts.forEach(([px, py], i) => i ? x.lineTo(px, py) : x.moveTo(px, py)); x.closePath(); paint(x, '#ffb300', 0.8, '#8a5a00');
+    for (let i = 0; i < 10; i++) {                                         // bevelled facets
+      const [ax, ay] = pts[i], [bx, by] = pts[(i + 1) % 10];
+      x.beginPath(); x.moveTo(7, 7.3); x.lineTo(ax, ay); x.lineTo(bx, by); x.closePath();
+      x.fillStyle = i % 2 ? (i < 5 ? '#ffe082' : '#ffca28') : (i < 5 ? '#fff3c4' : '#ffa000'); x.fill();
     }
-    R(4, 3, 1, 1, '#fff3c4'); R(3, 7, 1, 1, '#ffe082');
-  }, '#8a3d00'));
+    gloss(x, 5.4, 5.2, 1.2, 0.6, 0.7);
+  });
 
-  addImage(scene, 'star', sprite(14, 14, (R, c) => {
-    c.fillStyle = '#ffca28'; c.beginPath();
-    for (let i = 0; i < 10; i++) { const rr = i % 2 ? 2.8 : 6.2, a = (Math.PI / 5) * i - Math.PI / 2; const x = 7 + Math.cos(a) * rr, y = 7 + Math.sin(a) * rr; i ? c.lineTo(x, y) : c.moveTo(x, y); }
-    c.fill();
-    R(5, 5, 2, 2, '#fff8e1'); R(7, 8, 3, 2, '#ffa000');
-  }, '#8a5a00'));
-
-  const matka = used => sprite(16, 16, (R, c) => {
-    const body = used ? '#7d6a60' : '#b5653f', dk = used ? '#5f504a' : '#8c4a2b', lt = used ? '#94827a' : '#d4825a';
-    c.fillStyle = body; c.beginPath(); c.ellipse(8, 9.5, 7, 5.5, 0, 0, Math.PI * 2); c.fill();
-    R(4, 2, 8, 3, body); R(3, 1, 10, 2, dk); R(5, 1, 6, 1, '#3e1f12');
-    R(3, 7, 3, 2, lt); R(4, 6, 2, 1, lt);
-    if (!used) { for (let x = 2; x < 14; x += 3) R(x, 9, 2, 1, '#fff3e0'), R(x + 1, 10, 1, 1, '#fdd835'); R(7, 12, 2, 2, '#fff3e0'); }
-    else { R(9, 7, 1, 3, '#3e3430'); R(10, 9, 1, 2, '#3e3430'); }
+  const matka = used => hiArt(16, 16, x => {
+    const body = used ? '#7d6a60' : '#c06c42';
+    ellipse(x, 8, 9.6, 7, 5.6, sphere(x, 8, 9.6, 7, body), 0.75);
+    rrect(x, 4.4, 1.8, 7.2, 3.4, 1); paint(x, LG(x, 4.4, 0, 11.6, 0, [[0, lit(body, 0.25)], [1, lit(body, -0.3)]]), 0.6);
+    ellipse(x, 8, 1.8, 4.2, 1.2, lit(body, -0.2), 0.6); ellipse(x, 8, 1.8, 2.6, 0.6, '#2b140a', 0);
+    if (!used) {
+      x.save(); x.beginPath(); x.ellipse(8, 9.6, 7, 5.6, 0, 0, Math.PI * 2); x.clip();
+      x.fillStyle = '#fff3e0'; x.fillRect(0, 8.6, 16, 1.1);
+      x.strokeStyle = '#fdd835'; x.lineWidth = 0.6; x.beginPath();
+      for (let px = 1; px < 15; px += 2) { x.moveTo(px, 10.6); x.lineTo(px + 1, 11.8); x.lineTo(px + 2, 10.6); } x.stroke();
+      x.restore();
+      gloss(x, 5, 7, 1.8, 1.0, 0.55);
+    } else { x.strokeStyle = '#3e3430'; x.lineWidth = 0.5; x.beginPath(); x.moveTo(9, 6.5); x.lineTo(10, 9); x.lineTo(9.4, 11); x.stroke(); }
   });
   addImage(scene, 'matka', matka(false));
   addImage(scene, 'matka-used', matka(true));
 
   addSheet(scene, 'pkflag', 32, 26, [0, 1, 2, 3].map(i => drawPkFlag(i * Math.PI / 2)));
-  addImage(scene, 'pole', sprite(6, 100, R => { R(2, 6, 2, 94, '#cfd8dc'); R(2, 6, 1, 94, '#ffffff'); R(1, 1, 4, 5, '#ffca28'); R(0, 96, 6, 4, '#90a4ae'); }));
-  const cp = on => sprite(20, 36, R => {
-    R(3, 1, 2, 35, '#b0bec5'); R(3, 1, 1, 35, '#eceff1');
-    const fc = on ? '#01411c' : '#9e9e9e';
-    R(5, 3, 13, 9, fc); R(5, 3, 4, 9, on ? '#ffffff' : '#bdbdbd');
-    if (on) { R(12, 6, 3, 3, '#ffffff'); R(13, 6, 2, 2, '#01411c'); }
-    R(1, 33, 7, 3, '#78909c');
+  makeTex(scene, 'pole', 6, 100, x => {
+    rrect(x, 2, 6, 2, 93, 0.8); paint(x, LG(x, 2, 0, 4, 0, [[0, '#ffffff'], [0.5, '#cfd8dc'], [1, '#78909c']]), 0.5);
+    ellipse(x, 3, 3.4, 2.4, 2.4, sphere(x, 3, 3.4, 2.4, '#ffca28'), 0.5);
+    rrect(x, 0.4, 96, 5.2, 4, 0.8); paint(x, LG(x, 0, 96, 0, 100, [[0, '#b0bec5'], [1, '#546e7a']]), 0.5);
+  });
+  const cp = on => hiArt(20, 36, x => {
+    rrect(x, 2.6, 1, 1.8, 35, 0.8); paint(x, LG(x, 2.6, 0, 4.4, 0, [[0, '#ffffff'], [1, '#78909c']]), 0.45);
+    x.beginPath(); x.moveTo(4.4, 2.6); x.quadraticCurveTo(11, 1.6, 18.4, 4.2); x.lineTo(18.4, 11); x.quadraticCurveTo(11, 9.4, 4.4, 11.6); x.closePath();
+    paint(x, on ? LG(x, 4, 0, 19, 0, [[0, '#ffffff'], [0.28, '#ffffff'], [0.29, '#1b6b3a'], [1, '#01411c']]) : LG(x, 4, 0, 19, 0, [[0, '#e0e0e0'], [1, '#8d8d8d']]), 0.55);
+    if (on) { ellipse(x, 12.8, 7, 2.1, 2.1, '#ffffff', 0); ellipse(x, 13.6, 6.4, 1.8, 1.8, '#01411c', 0); }
+    rrect(x, 0.6, 33, 6, 3, 0.8); paint(x, '#78909c', 0.4);
   });
   addImage(scene, 'cp-off', cp(false));
   addImage(scene, 'cp-on', cp(true));
 
-  addImage(scene, 'ball', sprite(10, 10, (R, c) => {
-    c.fillStyle = '#c62828'; c.beginPath(); c.arc(5, 5, 3.6, 0, Math.PI * 2); c.fill();
-    R(2, 4, 6, 1, '#ffffff'); R(3, 3, 2, 1, '#ef9a9a');
-  }, '#4a0e0e'));
-
-  addImage(scene, 'samosa', sprite(16, 14, (R, c) => {
-    c.fillStyle = '#e0a84f'; c.beginPath(); c.moveTo(8, 1); c.lineTo(15, 12); c.lineTo(1, 12); c.closePath(); c.fill();
-    c.fillStyle = '#c3832f'; c.beginPath(); c.moveTo(8, 1); c.lineTo(15, 12); c.lineTo(9, 12); c.closePath(); c.fill();
-    R(5, 6, 2, 1, '#f6d08a'); R(4, 8, 2, 1, '#f6d08a');
-    for (let x = 2; x < 14; x += 2) R(x, 11, 1, 1, '#a5652a');
-  }, '#5a3410'));
-  addImage(scene, 'chai', sprite(14, 16, R => {        // kulhad (clay cup) with steam
-    R(3, 7, 8, 8, '#b5653f'); R(4, 15, 6, 1, '#8c4a2b'); R(3, 7, 2, 7, '#d4825a'); R(9, 7, 2, 8, '#8c4a2b');
-    R(3, 6, 8, 2, '#e8c9a0'); R(4, 6, 4, 1, '#f5e3c8');
-    R(5, 1, 1, 2, 'rgba(255,255,255,0.8)'); R(6, 3, 1, 2, 'rgba(255,255,255,0.8)'); R(8, 0, 1, 2, 'rgba(255,255,255,0.7)'); R(9, 2, 1, 2, 'rgba(255,255,255,0.7)');
-  }, '#4a2412'));
-  addImage(scene, 'patang', sprite(16, 18, (R, c) => {
-    c.fillStyle = '#e53935'; c.beginPath(); c.moveTo(8, 1); c.lineTo(15, 7); c.lineTo(8, 13); c.closePath(); c.fill();
-    c.fillStyle = '#fdd835'; c.beginPath(); c.moveTo(8, 1); c.lineTo(1, 7); c.lineTo(8, 13); c.closePath(); c.fill();
-    R(8, 1, 1, 12, '#6d4c41'); R(2, 7, 13, 1, '#6d4c41');
-    R(7, 13, 3, 2, '#43a047'); R(8, 15, 1, 2, '#6d4c41'); R(7, 16, 2, 1, '#43a047');
-  }, '#3a1010'));
-
-  makeTex(scene, 'cloud', 56, 22, (c) => {
-    const R = painter(c);
-    [[6, 10, 44, 10], [12, 5, 18, 8], [26, 2, 16, 10], [38, 7, 12, 6]].forEach(([x, y, w, h]) => R(x, y, w, h, '#ffffff'));
-    R(6, 18, 44, 2, '#dfe9f3'); R(12, 16, 32, 2, '#eef4fa');
+  makeTex(scene, 'ball', 10, 10, x => {
+    ellipse(x, 5, 5, 3.9, 3.9, sphere(x, 5, 5, 3.9, '#d32f2f'), 0.6);
+    x.strokeStyle = '#ffffff'; x.lineWidth = 0.45; x.beginPath(); x.arc(5, 1.4, 4.4, 0.3 * Math.PI, 0.7 * Math.PI); x.stroke();
+    gloss(x, 3.6, 3.4, 1.0, 0.55, 0.65);
   });
-  makeTex(scene, 'sun', 48, 48, (c) => {
-    [[24, 'rgba(255,248,220,0.18)'], [18, 'rgba(255,245,200,0.3)'], [12, '#fff6d5']].forEach(([rr, col]) => {
-      c.fillStyle = col; c.beginPath(); c.arc(24, 24, rr, 0, Math.PI * 2); c.fill();
-    });
+  makeTex(scene, 'samosa', 16, 14, x => {
+    x.beginPath(); x.moveTo(8, 1); x.quadraticCurveTo(15.6, 11, 15, 12.4); x.quadraticCurveTo(8, 13.6, 1, 12.4); x.quadraticCurveTo(0.4, 11, 8, 1); x.closePath();
+    paint(x, LG(x, 2, 2, 14, 13, [[0, '#f8d48b'], [0.5, '#e0a84f'], [1, '#a5652a']]), 0.75, '#5a3410');
+    x.strokeStyle = '#a5652a'; x.lineWidth = 0.4; x.beginPath(); for (let px = 2; px < 14.5; px += 1.4) { x.moveTo(px, 12.6); x.lineTo(px + 0.5, 11.6); } x.stroke();
+    gloss(x, 6, 6, 1.2, 0.6, 0.5);
+  });
+  makeTex(scene, 'chai', 14, 16, x => {        // kulhad (clay cup) with steam
+    x.beginPath(); x.moveTo(2.4, 6.4); x.lineTo(11.6, 6.4); x.lineTo(10.2, 15.2); x.lineTo(3.8, 15.2); x.closePath();
+    paint(x, LG(x, 2.4, 0, 11.6, 0, [[0, '#e0915e'], [0.4, '#c06c42'], [1, '#7a3c20']]), 0.65, '#4a2412');
+    ellipse(x, 7, 6.4, 4.6, 1.3, LG(x, 0, 5, 0, 7.6, [[0, '#f5e3c8'], [1, '#c9a27a']]), 0.55, '#4a2412');
+    x.strokeStyle = 'rgba(255,255,255,0.75)'; x.lineWidth = 0.6;
+    x.beginPath(); x.moveTo(5, 4.4); x.bezierCurveTo(4, 3, 6, 2, 5, 0.4); x.moveTo(8.6, 4.4); x.bezierCurveTo(7.6, 3, 9.6, 2, 8.6, 0.4); x.stroke();
+  });
+  makeTex(scene, 'patang', 16, 18, x => {
+    x.beginPath(); x.moveTo(8, 1); x.lineTo(15, 7); x.lineTo(8, 13); x.closePath(); paint(x, LG(x, 8, 1, 15, 13, [[0, '#ff6f60'], [1, '#c62828']]), 0.6, '#3a1010');
+    x.beginPath(); x.moveTo(8, 1); x.lineTo(1, 7); x.lineTo(8, 13); x.closePath(); paint(x, LG(x, 1, 1, 8, 13, [[0, '#fff176'], [1, '#f9a825']]), 0.6, '#3a1010');
+    x.strokeStyle = '#6d4c41'; x.lineWidth = 0.5; x.beginPath(); x.moveTo(8, 1); x.lineTo(8, 13); x.moveTo(1.4, 7); x.quadraticCurveTo(8, 4.6, 14.6, 7); x.stroke();
+    x.strokeStyle = '#6d4c41'; x.lineWidth = 0.35; x.beginPath(); x.moveTo(8, 13); x.quadraticCurveTo(6, 15.5, 8.6, 17.6); x.stroke();
+    [[7.2, 14.6], [8.2, 16.6]].forEach(([bx, by]) => ellipse(x, bx, by, 1.0, 0.55, '#43a047', 0.3));
+  });
+
+  makeTex(scene, 'cloud', 56, 22, x => {
+    const blobs = [[16, 13, 10, 7], [28, 9, 11, 8.5], [40, 12, 10, 7.5], [24, 15, 14, 5], [36, 15, 14, 5]];
+    blobs.forEach(([cx, cy, rx, ry]) => { x.beginPath(); x.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); x.fillStyle = LG(x, 0, cy - ry, 0, cy + ry, [[0, '#ffffff'], [0.6, '#f4f8fc'], [1, '#c9d8e8']]); x.fill(); });
+  });
+  makeTex(scene, 'sun', 48, 48, x => {
+    x.fillStyle = RG(x, 24, 24, 24, [[0, 'rgba(255,250,225,1)'], [0.3, 'rgba(255,240,190,0.95)'], [0.45, 'rgba(255,225,150,0.35)'], [1, 'rgba(255,220,150,0)']]);
+    x.fillRect(0, 0, 48, 48);
+  });
+  makeTex(scene, 'shadow', 20, 6, x => {
+    x.fillStyle = RG(x, 10, 3, 10, [[0, 'rgba(20,10,0,0.6)'], [0.55, 'rgba(20,10,0,0.32)'], [1, 'rgba(20,10,0,0)']]);
+    x.save(); x.scale(1, 0.3); x.fillRect(0, 0, 20, 20); x.restore();
+  });
+  makeTex(scene, 'vignette', GAME_WIDTH, GAME_HEIGHT, (x, w, h) => {
+    x.save(); x.scale(1, h / w);
+    x.fillStyle = RG(x, w / 2, w / 2, w * 0.72, [[0, 'rgba(0,0,0,0)'], [0.62, 'rgba(0,0,0,0)'], [1, 'rgba(10,5,30,0.42)']]);
+    x.fillRect(0, 0, w, w); x.restore();
+  });
+
+  makeTex(scene, 'backdrop', GAME_WIDTH, GAME_HEIGHT, (x, w, h) => {
+    x.fillStyle = LG(x, 0, 0, 0, h, [[0, '#0f5a2c'], [1, '#062814']]); x.fillRect(0, 0, w, h);
+    x.save(); x.scale(1, 0.55);
+    x.fillStyle = RG(x, w / 2, 40, w * 0.6, [[0, 'rgba(120,220,140,0.35)'], [1, 'rgba(120,220,140,0)']]); x.fillRect(0, 0, w, h / 0.55); x.restore();
+    x.globalAlpha = 0.06; x.strokeStyle = '#ffd54f'; x.lineWidth = 0.6;                     // faint geometric pattern
+    for (let gx = 0; gx < w + 30; gx += 30) for (let gy = 0; gy < h + 30; gy += 30) { x.beginPath(); x.moveTo(gx, gy - 9); x.lineTo(gx + 9, gy); x.lineTo(gx, gy + 9); x.lineTo(gx - 9, gy); x.closePath(); x.stroke(); }
+    x.globalAlpha = 1;
   });
 
   // particles
-  makeTex(scene, 'p-dust', 6, 6, c => { c.fillStyle = '#ffffff'; c.beginPath(); c.arc(3, 3, 3, 0, Math.PI * 2); c.fill(); });
-  makeTex(scene, 'p-spark', 5, 5, c => { c.fillStyle = '#ffffff'; c.fillRect(2, 0, 1, 5); c.fillRect(0, 2, 5, 1); c.fillRect(1, 1, 3, 3); });
-  makeTex(scene, 'p-confetti', 3, 4, c => { c.fillStyle = '#ffffff'; c.fillRect(0, 0, 3, 4); });
+  makeTex(scene, 'p-dust', 6, 6, x => { x.fillStyle = RG(x, 3, 3, 3, [[0, 'rgba(255,255,255,1)'], [1, 'rgba(255,255,255,0)']]); x.fillRect(0, 0, 6, 6); });
+  makeTex(scene, 'p-spark', 6, 6, x => {
+    x.fillStyle = RG(x, 3, 3, 3, [[0, 'rgba(255,255,255,1)'], [0.4, 'rgba(255,255,255,0.6)'], [1, 'rgba(255,255,255,0)']]); x.fillRect(0, 0, 6, 6);
+    x.fillStyle = '#ffffff'; x.fillRect(2.7, 0, 0.6, 6); x.fillRect(0, 2.7, 6, 0.6);
+  });
+  makeTex(scene, 'p-confetti', 3, 4, x => { x.fillStyle = '#ffffff'; x.fillRect(0, 0, 3, 4); x.fillStyle = 'rgba(0,0,0,0.2)'; x.fillRect(0, 2, 3, 2); });
 }
 
 function createAnimations(scene) {
@@ -883,18 +1072,24 @@ function createAnimations(scene) {
   });
 }
 
+/* ---- display helpers: hi-res textures are shown at 1/S scale ---- */
+/** scale a hi-res image/sprite to its world size (times an optional extra factor) */
+function hi(obj, k = 1) { obj.setScale(k / S); obj.hiK = k; return obj; }
+/** tileSprite whose hi-res texture tiles at world size */
+function hiTile(scene, x, y, w, h, key) { return scene.add.tileSprite(x, y, w, h, key).setTileScale(1 / S); }
+
 /* ---- particle effects ---- */
 class FX {
   constructor(scene, dustTint = 0xe0c9a0) {
     const P = (key, cfg, depth) => scene.add.particles(0, 0, key, Object.assign({ emitting: false }, cfg)).setDepth(depth);
-    this.dustE = P('p-dust', { lifespan: { min: 250, max: 450 }, speed: { min: 10, max: 40 }, angle: { min: 200, max: 340 },
-      scale: { start: 0.9, end: 0.2 }, alpha: { start: 0.75, end: 0 }, gravityY: -40, tint: dustTint }, 9);
-    this.sparkE = P('p-spark', { lifespan: 500, speed: { min: 40, max: 120 }, scale: { start: 1, end: 0 },
-      alpha: { start: 1, end: 0 }, gravityY: 120, tint: [0xffd54f, 0xffffff, 0xffb300] }, 20);
-    this.poofE = P('p-dust', { lifespan: 380, speed: { min: 30, max: 80 }, scale: { start: 1.3, end: 0.1 },
+    this.dustE = P('p-dust', { lifespan: { min: 300, max: 500 }, speed: { min: 10, max: 40 }, angle: { min: 200, max: 340 },
+      scale: { start: 1.1 / S, end: 0.3 / S }, alpha: { start: 0.7, end: 0 }, gravityY: -40, tint: dustTint }, 9);
+    this.sparkE = P('p-spark', { lifespan: 550, speed: { min: 40, max: 120 }, scale: { start: 1.1 / S, end: 0 },
+      alpha: { start: 1, end: 0 }, gravityY: 120, tint: [0xffd54f, 0xffffff, 0xffb300], blendMode: 'ADD' }, 20);
+    this.poofE = P('p-dust', { lifespan: 420, speed: { min: 30, max: 80 }, scale: { start: 1.6 / S, end: 0.2 / S },
       alpha: { start: 0.9, end: 0 }, tint: 0xffffff }, 20);
     this.confE = P('p-confetti', { lifespan: 1800, speedX: { min: -90, max: 90 }, speedY: { min: -280, max: -120 },
-      gravityY: 320, rotate: { min: 0, max: 360 }, tint: [0x01411c, 0xffffff, 0x43a047, 0xffd54f, 0xe91e63] }, 30);
+      gravityY: 320, rotate: { min: 0, max: 360 }, scale: 1 / S, tint: [0x01411c, 0xffffff, 0x43a047, 0xffd54f, 0xe91e63] }, 30);
   }
   dust(x, y, n = 4) { this.dustE.explode(n, x, y); }
   spark(x, y, n = 8) { this.sparkE.explode(n, x, y); }
@@ -1030,11 +1225,12 @@ class Player extends Phaser.Physics.Arcade.Sprite {
     super(scene, x, y, hero.id, 0);
     scene.add.existing(this);
     scene.physics.add.existing(this);
+    hi(this);
 
     this.hero = hero;
     this.inputMgr = inputMgr;
     this.setDepth(10);
-    this.body.setSize(12, 26).setOffset(6, 6);
+    this.body.setSize(12 * S, 26 * S).setOffset(6 * S, 6 * S);
     this.setCollideWorldBounds(true);
     this.body.setMaxVelocityY(MAX_FALL_SPEED);
 
@@ -1078,13 +1274,13 @@ class Player extends Phaser.Physics.Arcade.Sprite {
   grow() {
     if (this.isBig) return;
     this.isBig = true;
-    this.setScale(1.25);
+    hi(this, 1.25);
     this.y -= 4;
   }
 
   shrink() {
     this.isBig = false;
-    this.setScale(1);
+    hi(this, 1);
   }
 
   update(time) {
@@ -1215,6 +1411,7 @@ class Enemy extends Phaser.Physics.Arcade.Sprite {
     super(scene, x, y, key, 0);
     scene.add.existing(this);
     scene.physics.add.existing(this);
+    hi(this);
     this.setDepth(6);
     if (scene.anims.exists(`${key}-move`)) this.play({ key: `${key}-move`, startFrame: Math.floor(Math.random() * 2) });
     this.alive = true;
@@ -1235,7 +1432,7 @@ class Enemy extends Phaser.Physics.Arcade.Sprite {
     this.body.enable = false;
     this.anims.stop();
     this.scene.fx.poof(this.x, this.y);
-    this.setScale(1.15, 0.35);
+    this.setScale(1.15 / S, 0.35 / S);
     this.y += this.displayHeight;
     this.scene.tweens.add({ targets: this, alpha: 0, delay: 250, duration: 200, onComplete: () => this.destroy() });
   }
@@ -1256,7 +1453,7 @@ class Enemy extends Phaser.Physics.Arcade.Sprite {
 class Goon extends Enemy {
   constructor(scene, x, y) {
     super(scene, x, y, 'goon');
-    this.body.setSize(14, 12).setOffset(1, 4);
+    this.body.setSize(14 * S, 12 * S).setOffset(1 * S, 4 * S);
     this.speed = 40;
     this.dir = -1;
   }
@@ -1277,7 +1474,7 @@ class Machhar extends Enemy {
   constructor(scene, x, y) {
     super(scene, x, y, 'machhar');
     this.body.setAllowGravity(false);
-    this.body.setSize(12, 12).setOffset(2, 2);
+    this.body.setSize(12 * S, 12 * S).setOffset(2 * S, 2 * S);
     this.baseX = x; this.baseY = y;
     this.phase = Math.random() * Math.PI * 2;
   }
@@ -1295,7 +1492,7 @@ class Kawwa extends Enemy {
   constructor(scene, x, y) {
     super(scene, x, y, 'kawwa');
     this.body.setAllowGravity(false);
-    this.body.setSize(16, 10).setOffset(2, 4);
+    this.body.setSize(16 * S, 10 * S).setOffset(2 * S, 4 * S);
     this.baseY = y;
     this.mode = 'cruise';
     this.nextDive = 0;
@@ -1334,15 +1531,34 @@ const ENEMY_TYPES = { goon: Goon, machhar: Machhar, kawwa: Kawwa };
 
 /* ------------------------------ 10. UI HELPERS ---------------------------- */
 const TXT = (size = 10, color = '#ffffff', extra = {}) =>
-  Object.assign({ fontFamily: 'monospace', fontSize: `${size}px`, color, resolution: Math.max(3, Z) }, extra);
+  Object.assign({ fontFamily: '"Baloo 2", "Trebuchet MS", Verdana, sans-serif', fontSize: `${size}px`, color, resolution: Math.max(3, Z) }, extra);
 
 function makeButton(scene, x, y, label, onClick, w = 110, h = 22) {
-  const bg = scene.add.rectangle(x, y, w, h, 0x01411c).setStrokeStyle(2, 0xffd54f).setInteractive({ useHandCursor: true });
-  const t = scene.add.text(x, y, label, TXT(10, '#ffffff', { fontStyle: 'bold' })).setOrigin(0.5);
-  bg.on('pointerover', () => bg.setFillStyle(0x2e7d32));
-  bg.on('pointerout', () => bg.setFillStyle(0x01411c));
-  bg.on('pointerdown', () => { Sfx.init(); onClick(); });
+  const g = scene.add.graphics();
+  const draw = (hover, down) => {
+    g.clear();
+    const oy = down ? 1.5 : 0;
+    g.fillStyle(0x000000, 0.35).fillRoundedRect(x - w / 2 + 1, y - h / 2 + 3, w, h, 7);          // drop shadow
+    g.fillStyle(0x00290f, 1).fillRoundedRect(x - w / 2, y - h / 2 + 2, w, h, 7);                  // 3D base
+    g.fillGradientStyle(hover ? 0x3d9b56 : 0x2e7d32, hover ? 0x3d9b56 : 0x2e7d32, 0x0b4d22, 0x0b4d22, 1);
+    g.fillRoundedRect(x - w / 2, y - h / 2 + oy, w, h - 1, 7);
+    g.fillStyle(0xffffff, 0.22).fillRoundedRect(x - w / 2 + 3, y - h / 2 + oy + 2, w - 6, h * 0.32, 5);  // gloss
+    g.lineStyle(1.5, 0xffd54f, 1).strokeRoundedRect(x - w / 2, y - h / 2 + oy, w, h - 1, 7);
+  };
+  draw(false, false);
+  const t = scene.add.text(x, y - 0.5, label, TXT(11, '#ffffff', { fontStyle: 'bold', stroke: '#0b3d1c', strokeThickness: 3 })).setOrigin(0.5);
+  const bg = scene.add.zone(x, y, w, h).setInteractive({ useHandCursor: true });
+  bg.on('pointerover', () => draw(true, false));
+  bg.on('pointerout', () => { draw(false, false); t.y = y - 0.5; });
+  bg.on('pointerdown', () => { draw(true, true); t.y = y + 1; Sfx.init(); onClick(); });
   return { bg, t };
+}
+
+/** glossy 3D gradient lettering for screen titles */
+function glossyTitle(t, top = '#fff8d0', mid = '#ffd54f', low = '#ffb300', bottom = '#e65100') {
+  const g = t.context.createLinearGradient(0, 0, 0, t.height);
+  g.addColorStop(0, top); g.addColorStop(0.45, mid); g.addColorStop(0.55, low); g.addColorStop(1, bottom);
+  return t.setFill(g).setStroke('#4a1f00', Math.max(4, t.style.strokeThickness || 0)).setShadow(0, 2, '#2a1000', 0, true, false);
 }
 
 // truck-art style border
@@ -1376,21 +1592,21 @@ class MenuScene extends Phaser.Scene {
     const L = LEVELS['1-1'], gt = 224;
     buildLevelArt(this, L);
     this.cameras.main.fadeIn(300);
-    this.add.image(0, 0, 'sky-1-1').setOrigin(0);
-    this.add.image(410, 44, 'sun');
+    hi(this.add.image(0, 0, 'sky-1-1').setOrigin(0));
+    hi(this.add.image(410, 44, 'sun'), 1.3);
     [[60, 34, 1], [250, 56, 0.7], [390, 24, 0.8]].forEach(([x, y, sc]) => {
-      const c = this.add.image(x, y, 'cloud').setScale(sc);
+      const c = hi(this.add.image(x, y, 'cloud'), sc);
       this.tweens.add({ targets: c, x: x + 30, duration: 9000, yoyo: true, repeat: -1, ease: 'Sine.inOut' });
     });
-    this.bgFar = this.add.tileSprite(0, gt + 22 - 150, GAME_WIDTH, 150, 'far-1-1').setOrigin(0);
-    this.bgMid = this.add.tileSprite(0, gt + 6 - 110, GAME_WIDTH, 110, 'mid-1-1').setOrigin(0);
+    this.bgFar = hiTile(this, 0, gt + 22 - 150, GAME_WIDTH, 150, 'far-1-1').setOrigin(0);
+    this.bgMid = hiTile(this, 0, gt + 6 - 110, GAME_WIDTH, 110, 'mid-1-1').setOrigin(0);
     for (let i = 0; i < 5; i++) {
-      const k = this.add.image(30 + i * 105, 150 + (i % 2) * 18, 'patang').setScale(1.4)
+      const k = hi(this.add.image(30 + i * 105, 150 + (i % 2) * 18, 'patang'), 1.4)
         .setTint([0xffffff, 0xa5d6a7, 0x90caf9, 0xf8bbd0, 0xfff59d][i]);
       this.tweens.add({ targets: k, y: k.y - 12, angle: 14, duration: 1300 + i * 170, yoyo: true, repeat: -1, ease: 'Sine.inOut' });
     }
-    this.ground = this.add.tileSprite(0, gt, GAME_WIDTH, 16, 'gtop-1-1').setOrigin(0);
-    this.groundFill = this.add.tileSprite(0, gt + 16, GAME_WIDTH, GAME_HEIGHT - gt - 16, 'gfill-1-1').setOrigin(0);
+    this.ground = hiTile(this, 0, gt, GAME_WIDTH, 16, 'gtop-1-1').setOrigin(0);
+    this.groundFill = hiTile(this, 0, gt + 16, GAME_WIDTH, GAME_HEIGHT - gt - 16, 'gfill-1-1').setOrigin(0);
 
     // title panel in truck-art style
     const g = this.add.graphics();
@@ -1403,12 +1619,16 @@ class MenuScene extends Phaser.Scene {
       g.fillStyle(dots[(i + 2) % 4]).fillCircle(116 + i * 12, 118, 2.2);
     }
     this.add.text(GAME_WIDTH / 2 + 2, 64, 'DESI DASH', TXT(38, '#000000', { fontStyle: 'bold' })).setOrigin(0.5).setAlpha(0.35);
-    this.add.text(GAME_WIDTH / 2, 62, 'DESI DASH', TXT(38, '#ffd54f', { fontStyle: 'bold', stroke: '#7a3b00', strokeThickness: 5 })).setOrigin(0.5);
+    const title = this.add.text(GAME_WIDTH / 2, 62, 'DESI DASH', TXT(40, '#ffd54f', { fontStyle: 'bold', stroke: '#6d2f00', strokeThickness: 6 })).setOrigin(0.5);
+    const tg = title.context.createLinearGradient(0, 0, 0, title.height);
+    tg.addColorStop(0, '#fff8d0'); tg.addColorStop(0.45, '#ffd54f'); tg.addColorStop(0.55, '#ffb300'); tg.addColorStop(1, '#e65100');
+    title.setFill(tg).setShadow(0, 3, '#3a1500', 0, true, false);
     this.add.text(GAME_WIDTH / 2, 92, 'دیسی ڈیش', TXT(15, '#ffffff')).setOrigin(0.5);
     this.add.text(GAME_WIDTH / 2, 109, 'Find the lost festival kite across Pakistan!', TXT(8, '#c8e6c9')).setOrigin(0.5);
 
     HEROES.forEach((h, i) => {
-      const sp = this.add.sprite(GAME_WIDTH / 2 - 125 + i * 50, gt - 16, h.id).setScale(1);
+      const sp = hi(this.add.sprite(GAME_WIDTH / 2 - 125 + i * 50, gt - 16, h.id));
+      hi(this.add.image(sp.x, gt + 0.5, 'shadow'), 0.7).setAlpha(0.8);
       sp.play({ key: `${h.id}-walk`, startFrame: i % 4 });
     });
 
@@ -1454,8 +1674,9 @@ class CharacterSelectScene extends Phaser.Scene {
     useCam(this);
     this.cameras.main.fadeIn(250);
     this.cameras.main.setBackgroundColor('#0d3b24');
+    hi(this.add.image(0, 0, 'backdrop')).setOrigin(0);
     truckBorder(this);
-    this.add.text(GAME_WIDTH / 2, 24, 'CHOOSE YOUR HERO', TXT(16, '#ffd54f', { fontStyle: 'bold' })).setOrigin(0.5);
+    glossyTitle(this.add.text(GAME_WIDTH / 2, 26, 'CHOOSE YOUR HERO', TXT(20, '#ffd54f', { fontStyle: 'bold' })).setOrigin(0.5));
 
     const saved = SaveManager.load().hero;
     this.index = Math.max(0, HEROES.findIndex(h => h.id === saved));
@@ -1463,7 +1684,7 @@ class CharacterSelectScene extends Phaser.Scene {
       const x = 50 + i * 76;
       const frame = this.add.rectangle(x, 92, 64, 74, 0x000000, 0.25).setStrokeStyle(2, 0x2e7d32)
         .setInteractive({ useHandCursor: true });
-      const spr = this.add.sprite(x, 82, h.id).setScale(2);
+      const spr = hi(this.add.sprite(x, 82, h.id), 2);
       spr.play(`${h.id}-idle`);
       this.add.text(x, 121, h.name, TXT(9, '#ffffff', { fontStyle: 'bold' })).setOrigin(0.5);
       frame.on('pointerdown', () => {
@@ -1515,8 +1736,9 @@ class LevelSelectScene extends Phaser.Scene {
     useCam(this);
     this.cameras.main.fadeIn(250);
     this.cameras.main.setBackgroundColor('#0d3b24');
+    hi(this.add.image(0, 0, 'backdrop')).setOrigin(0);
     truckBorder(this);
-    this.add.text(GAME_WIDTH / 2, 24, 'SELECT LEVEL', TXT(16, '#ffd54f', { fontStyle: 'bold' })).setOrigin(0.5);
+    glossyTitle(this.add.text(GAME_WIDTH / 2, 26, 'SELECT LEVEL', TXT(20, '#ffd54f', { fontStyle: 'bold' })).setOrigin(0.5));
     const save = SaveManager.load();
     this.save = save;
     this.index = Math.max(0, LEVEL_ORDER.filter(id => save.unlocked.includes(id)).length - 1);
@@ -1528,11 +1750,11 @@ class LevelSelectScene extends Phaser.Scene {
       buildLevelArt(this, L);
       const top = 58, cw = 132, ch = 120;
       this.add.image(x, top + ch / 2, `sky-${id}`).setDisplaySize(cw, ch);
-      const farT = this.add.tileSprite(x - cw / 2, top + ch - 40, cw * 2, 150, `far-${id}`).setOrigin(0, 1).setScale(0.5);
-      const midH = this.textures.get(`mid-${id}`).getSourceImage().height;
-      this.add.tileSprite(x - cw / 2, top + ch - 30, cw * 2, midH, `mid-${id}`).setOrigin(0, 1).setScale(0.5);
-      this.add.tileSprite(x - cw / 2, top + ch - 34, cw, 8, `gtop-${id}`).setOrigin(0);
-      this.add.tileSprite(x - cw / 2, top + ch - 26, cw, 26, `gfill-${id}`).setOrigin(0);
+      const farT = hiTile(this, x - cw / 2, top + ch - 40, cw * 2, 150, `far-${id}`).setOrigin(0, 1).setScale(0.5);
+      const midH = this.textures.get(`mid-${id}`).getSourceImage().height / S;
+      hiTile(this, x - cw / 2, top + ch - 30, cw * 2, midH, `mid-${id}`).setOrigin(0, 1).setScale(0.5);
+      hiTile(this, x - cw / 2, top + ch - 34, cw, 8, `gtop-${id}`).setOrigin(0).setTileScale(0.5 / S);
+      hiTile(this, x - cw / 2, top + ch - 26, cw, 26, `gfill-${id}`).setOrigin(0).setTileScale(0.5 / S);
       if (themeOf(L) === 'karachi') farT.y = top + 62;
       const card = this.add.rectangle(x, top + ch / 2, cw, ch, 0x000000, unlocked ? 0.001 : 0.6)
         .setStrokeStyle(3, 0x2e7d32).setInteractive({ useHandCursor: true });
@@ -1540,7 +1762,7 @@ class LevelSelectScene extends Phaser.Scene {
       this.add.text(x, top + 32, L.name, TXT(9, '#ffffff', { fontStyle: 'bold', align: 'center', stroke: '#000', strokeThickness: 3, wordWrap: { width: 124 } })).setOrigin(0.5);
       const stars = save.stars[id] || 0;
       if (unlocked) {
-        for (let k = 0; k < 3; k++) this.add.image(x - 18 + k * 18, top + 62, 'star').setAlpha(k < stars ? 1 : 0.3);
+        for (let k = 0; k < 3; k++) hi(this.add.image(x - 18 + k * 18, top + 62, 'star')).setAlpha(k < stars ? 1 : 0.3);
       } else this.add.text(x, top + 62, 'LOCKED', TXT(12, '#ffffff', { fontStyle: 'bold', stroke: '#000', strokeThickness: 3 })).setOrigin(0.5);
       this.add.text(x, top + ch - 13, unlocked ? `BEST ${save.best[id] || 0}` : '', TXT(9, '#ffffff', { fontStyle: 'bold', stroke: '#000', strokeThickness: 3 })).setOrigin(0.5);
       card.on('pointerdown', () => {
@@ -1619,8 +1841,8 @@ class GameScene extends Phaser.Scene {
     this.groundGroup = this.physics.add.staticGroup();
     L.ground.forEach(([sx, len]) => {
       const x = sx * TILE, w = len * TILE, h = CAM_H + 32 - gt;
-      this.add.tileSprite(x, gt, w, TILE, `gtop-${L.id}`).setOrigin(0).setDepth(2);
-      this.add.tileSprite(x, gt + TILE, w, h - TILE, `gfill-${L.id}`).setOrigin(0).setDepth(2);
+      hiTile(this, x, gt, w, TILE, `gtop-${L.id}`).setOrigin(0).setDepth(2);
+      hiTile(this, x, gt + TILE, w, h - TILE, `gfill-${L.id}`).setOrigin(0).setDepth(2);
       const z = this.add.zone(x + w / 2, gt + h / 2, w, h);
       this.physics.add.existing(z, true);
       this.groundGroup.add(z);
@@ -1631,7 +1853,8 @@ class GameScene extends Phaser.Scene {
     this.platformGroup = this.physics.add.staticGroup();
     L.platforms.forEach(([sx, row, len]) => {
       const x = sx * TILE, y = row * TILE, w = len * TILE;
-      this.add.tileSprite(x, y, w, TILE, `plat-${L.id}`).setOrigin(0).setDepth(2);
+      hiTile(this, x, y, w, TILE, `plat-${L.id}`).setOrigin(0).setDepth(2);
+      hi(this.add.image(x + w / 2, y + 15, 'shadow'), w / 16).setAlpha(0.35).setDepth(1.9);   // soft shadow under the ledge
       const z = this.add.zone(x + w / 2, y + TILE / 2, w, TILE);
       this.physics.add.existing(z, true);
       z.body.checkCollision.down = false;
@@ -1644,7 +1867,7 @@ class GameScene extends Phaser.Scene {
     /* matka blocks */
     this.matkas = this.physics.add.staticGroup();
     L.matkas.forEach(([tx, ty], i) => {
-      const m = this.matkas.create(tx * TILE + 8, ty * TILE + 8, 'matka').setDepth(3);
+      const m = hi(this.matkas.create(tx * TILE + 8, ty * TILE + 8, 'matka')).setDepth(3).refreshBody();
       m.used = false;
       m.idx = i;
       this.solid.add(`${tx},${ty}`);
@@ -1653,12 +1876,12 @@ class GameScene extends Phaser.Scene {
     /* collectibles */
     this.coins = this.physics.add.staticGroup();
     L.coins.forEach(([tx, ty]) => {
-      const c = this.coins.create(tx * TILE + 8, ty * TILE + 8, 'jalebi').setDepth(4);
-      this.tweens.add({ targets: c, scaleX: 0.4, duration: 420, yoyo: true, repeat: -1, delay: (tx * 37) % 400 });
+      const c = hi(this.coins.create(tx * TILE + 8, ty * TILE + 8, 'jalebi')).setDepth(4).refreshBody();
+      this.tweens.add({ targets: c, scaleX: 0.35 / S, duration: 460, yoyo: true, repeat: -1, ease: 'Sine.inOut', delay: (tx * 37) % 400 });
     });
     this.starsGroup = this.physics.add.staticGroup();
     L.stars.forEach(([tx, ty], i) => {
-      const s = this.starsGroup.create(tx * TILE + 8, ty * TILE + 8, 'star').setDepth(4);
+      const s = hi(this.starsGroup.create(tx * TILE + 8, ty * TILE + 8, 'star')).setDepth(4).refreshBody();
       s.idx = i;
       this.tweens.add({ targets: s, angle: 360, duration: 2400, repeat: -1 });
     });
@@ -1666,16 +1889,17 @@ class GameScene extends Phaser.Scene {
 
     /* checkpoint + flag */
     const cpX = L.checkpoint * TILE + 8;
-    this.checkpoint = this.add.image(cpX, gt, this.checkpointHit ? 'cp-on' : 'cp-off').setOrigin(0.25, 1).setDepth(3);
+    this.checkpoint = hi(this.add.image(cpX, gt, this.checkpointHit ? 'cp-on' : 'cp-off')).setOrigin(0.25, 1).setDepth(3);
     this.cpZone = this.add.zone(cpX, gt / 2, 16, gt);
     this.physics.add.existing(this.cpZone, true);
     const fX = L.flag * TILE + 8;
-    this.add.image(fX, gt, 'pole').setOrigin(0.5, 1).setDepth(3);
-    this.flagSprite = this.add.sprite(fX + 2, gt - 84, 'pkflag', 0).setOrigin(0, 0.5).setDepth(3).play('pkflag-move');
+    hi(this.add.image(fX, gt, 'pole')).setOrigin(0.5, 1).setDepth(3);
+    this.flagSprite = hi(this.add.sprite(fX + 2, gt - 84, 'pkflag', 0)).setOrigin(0, 0.5).setDepth(3).play('pkflag-move');
     this.flagZone = this.add.zone(fX, gt / 2, 10, gt);
     this.physics.add.existing(this.flagZone, true);
 
     /* enemies */
+    this.shadows = [];
     this.walkers = this.physics.add.group({ runChildUpdate: true });
     this.flyers = this.physics.add.group({ runChildUpdate: true, allowGravity: false });
     L.enemies.forEach(e => {
@@ -1683,11 +1907,12 @@ class GameScene extends Phaser.Scene {
       if (!Cls) return;
       if (this.respawnX && e.x * TILE < this.respawnX + 40) return; // keep checkpoint start fair
       const x = e.x * TILE + 8;
-      if (e.t === 'goon') this.walkers.add(new Cls(this, x, gt - 8));
+      if (e.t === 'goon') { const g = new Cls(this, x, gt - 8); this.walkers.add(g); this.addShadow(g, 0.95); }
       else {
         const en = new Cls(this, x, (e.y || 9) * TILE + 8);
         this.flyers.add(en);
         en.body.setAllowGravity(false);
+        this.addShadow(en, 0.75);
       }
     });
 
@@ -1697,6 +1922,7 @@ class GameScene extends Phaser.Scene {
     this.player = new Player(this, startX, gt - 24, this.hero, this.inputMgr);
     this.camFollow = true;
     this.cameras.main.scrollX = Phaser.Math.Clamp(this.player.x - GAME_WIDTH * 0.4, 0, W - GAME_WIDTH);
+    this.addShadow(this.player, 1.1);
     // camera runs after physics has moved the sprites, so hero and world never drift apart
     this.events.on('postupdate', this.updateCamera, this);
 
@@ -1743,16 +1969,16 @@ class GameScene extends Phaser.Scene {
   buildBackground() {
     const L = this.L, gt = L.groundTop * TILE, th = themeOf(L);
     this.themeName = th;
-    this.add.image(0, 0, `sky-${L.id}`).setOrigin(0).setScrollFactor(0).setDepth(-10);
-    this.add.image(th === 'thar' ? 370 : 405, th === 'thar' ? 54 : 44, 'sun').setScrollFactor(0).setDepth(-9).setScale(th === 'thar' ? 1.5 : 1);
+    hi(this.add.image(0, 0, `sky-${L.id}`)).setOrigin(0).setScrollFactor(0).setDepth(-10);
+    hi(this.add.image(400, th === 'thar' ? 50 : 40, 'sun'), th === 'thar' ? 1.9 : 1.4).setScrollFactor(0).setDepth(-9);
 
     // clouds (and kites over Lahore) drift with slow parallax
     for (let i = 0; i < Math.ceil(L.width / 18); i++) {
       const x = i * 280 + (i * 97) % 140, y = 16 + (i * 53) % 52;
-      this.add.image(x, y, 'cloud').setScrollFactor(0.1 + (i % 3) * 0.05).setDepth(-8)
-        .setAlpha(th === 'thar' ? 0.55 : 0.95).setScale(i % 2 ? 1 : 0.7);
+      hi(this.add.image(x, y, 'cloud'), i % 2 ? 1 : 0.7).setScrollFactor(0.1 + (i % 3) * 0.05).setDepth(-8)
+        .setAlpha(th === 'thar' ? 0.55 : 0.95);
       if (th === 'lahore' && i % 2 === 0) {
-        const k = this.add.image(x + 110, y + 34, 'patang').setScrollFactor(0.22).setDepth(-7.5)
+        const k = hi(this.add.image(x + 110, y + 34, 'patang')).setScrollFactor(0.22).setDepth(-7.5)
           .setTint([0xffffff, 0xa5d6a7, 0x90caf9, 0xf8bbd0][i % 4]);
         this.tweens.add({ targets: k, y: k.y - 8, angle: 12, duration: 1400 + i * 90, yoyo: true, repeat: -1, ease: 'Sine.inOut' });
       }
@@ -1760,8 +1986,8 @@ class GameScene extends Phaser.Scene {
 
     const layer = (key, bottom, depth) => {
       if (!this.textures.exists(key)) return null;
-      const h = this.textures.get(key).getSourceImage().height;
-      return this.add.tileSprite(0, bottom - h, GAME_WIDTH, h, key).setOrigin(0).setScrollFactor(0).setDepth(depth);
+      const h = this.textures.get(key).getSourceImage().height / S;
+      return hiTile(this, 0, bottom - h, GAME_WIDTH, h, key).setOrigin(0).setScrollFactor(0).setDepth(depth);
     };
     this.far = layer(`far-${L.id}`, th === 'karachi' ? gt - 54 : gt + 22, -7);
     const pit = { lahore: 0x4a2f2a, karachi: 0x1d5f85, thar: 0xa8733f }[th];
@@ -1769,11 +1995,13 @@ class GameScene extends Phaser.Scene {
     this.add.rectangle(0, gt + 4, GAME_WIDTH, 6, 0x000000, 0.18).setOrigin(0).setScrollFactor(0).setDepth(-4.4);
     this.mid = layer(`mid-${L.id}`, gt + (th === 'lahore' ? 6 : 12), -6);
     this.near = layer(`near-${L.id}`, gt + 4, -5);
+    hi(this.add.image(0, 0, 'vignette')).setOrigin(0).setScrollFactor(0).setDepth(45);
   }
 
   /** Mario-style camera: the hero can move freely inside a window in the middle of the
       screen; the view only scrolls (smoothly) when they push past its edges. */
   updateCamera(time, delta) {
+    this.updateShadows();
     const cam = this.cameras.main, p = this.player;
     if (this.camFollow && p) {
       const winL = cam.scrollX + GAME_WIDTH * 0.36, winR = cam.scrollX + GAME_WIDTH * 0.5;
@@ -1789,6 +2017,29 @@ class GameScene extends Phaser.Scene {
     if (this.far) this.far.tilePositionX = cam.scrollX * 0.12;
     if (this.mid) this.mid.tilePositionX = cam.scrollX * 0.3 + (this.themeName === 'karachi' ? time * 0.004 : 0);
     if (this.near) this.near.tilePositionX = cam.scrollX * 0.55;
+  }
+
+  /** soft shadow on the ground beneath a character; shrinks and fades as it rises */
+  addShadow(target, k) {
+    const sh = hi(this.add.image(target.x, target.y, 'shadow'), k).setDepth(5).setVisible(false);
+    sh.target = target; sh.baseK = k;
+    this.shadows.push(sh);
+  }
+  updateShadows() {
+    this.shadows = this.shadows.filter(sh => {
+      const t = sh.target;
+      if (!t.active) { sh.destroy(); return false; }
+      if (!t.body || !t.body.enable || t.dead || t.alive === false) { sh.setVisible(false); return true; }
+      const col = Math.floor(t.x / TILE);
+      let floor = null;
+      for (let row = Math.max(0, Math.floor((t.body.bottom - 2) / TILE)); row < 18; row++) {
+        if (this.solid.has(`${col},${row}`)) { floor = row * TILE; break; }
+      }
+      if (floor === null) { sh.setVisible(false); return true; }
+      const k = Phaser.Math.Clamp(1 - (floor - t.body.bottom) / 120, 0.35, 1);
+      sh.setVisible(true).setPosition(t.x, floor + 0.6).setScale(sh.baseK * k / S).setAlpha(k);
+      return true;
+    });
   }
 
   isSolidAt(px, py) {
@@ -1834,7 +2085,7 @@ class GameScene extends Phaser.Scene {
     this.fx.spark(m.x, m.y - 8, 6);
     this.tweens.add({ targets: m, y: m.y - 5, duration: 70, yoyo: true });
     const kind = !p.isBig ? 'samosa' : ['ball', 'chai', 'patang'][m.idx % 3];
-    const it = this.items.create(m.x, m.y, kind).setDepth(2);
+    const it = hi(this.items.create(m.x, m.y, kind)).setDepth(2);
     it.kind = kind;
     it.body.enable = false;
     this.tweens.add({ targets: it, y: m.y - 16, duration: 300, onComplete: () => {
@@ -1897,11 +2148,12 @@ class GameScene extends Phaser.Scene {
   throwBall(p) {
     const b = this.balls.get(p.x + p.facing * 10, p.y - 2, 'ball');
     if (!b) return;
+    hi(b);
     b.setActive(true).setVisible(true).setDepth(9);
     b.body.enable = true;
     b.body.reset(p.x + p.facing * 10, p.y - 2);
     b.body.setAllowGravity(true);
-    b.body.setCircle(4, 1, 1);
+    b.body.setCircle(4 * S, 1 * S, 1 * S);
     b.setBounce(0.65, 0.65);
     const speed = p.hero.ability === 'fastThrow' ? 340 : 280;
     b.setVelocity(p.facing * speed, -80);
@@ -2005,7 +2257,7 @@ class GameScene extends Phaser.Scene {
     // performance watchdog: if frames drop for ~2 s, render at a lighter scale
     const now = performance.now();
     if (!this.fpsWatch) this.fpsWatch = { since: now + 1500, lowFrom: 0 };
-    if (now > this.fpsWatch.since && Z > 1) {
+    if (now > this.fpsWatch.since && Z > 1 && !Z_FORCED) {
       if (this.game.loop.actualFps >= 45) this.fpsWatch.lowFrom = 0;
       else if (!this.fpsWatch.lowFrom) this.fpsWatch.lowFrom = now;
       else if (now - this.fpsWatch.lowFrom > 2000) {
@@ -2030,12 +2282,12 @@ class HUDScene extends Phaser.Scene {
 
     const s = TXT(9, '#ffffff', { fontStyle: 'bold', stroke: '#000', strokeThickness: 2 });
     const heroId = SaveManager.load().hero;
-    this.add.image(0, -1, heroId, 0).setOrigin(0).setCrop(5, 0, 14, 13);
+    hi(this.add.image(0, -1, heroId, 0)).setOrigin(0).setCrop(5 * S, 0, 14 * S, 13 * S);
     this.livesT = this.add.text(21, 6, '', s);
     this.scoreT = this.add.text(52, 6, '', s);
-    this.add.image(156, 11, 'jalebi');
+    hi(this.add.image(156, 11, 'jalebi'));
     this.coinT = this.add.text(165, 6, '', s);
-    this.starImgs = [0, 1, 2].map(i => this.add.image(214 + i * 15, 11, 'star').setScale(0.85));
+    this.starImgs = [0, 1, 2].map(i => hi(this.add.image(214 + i * 15, 11, 'star'), 0.85));
     this.levelT = this.add.text(268, 6, '', TXT(9, '#c8e6c9', { fontStyle: 'bold', stroke: '#000', strokeThickness: 2 }));
     this.timeT = this.add.text(GAME_WIDTH - 98, 6, '', s);
     this.powerT = this.add.text(8, 30, '', TXT(8, '#80deea', { fontStyle: 'bold', stroke: '#000', strokeThickness: 3 }));
@@ -2072,7 +2324,7 @@ class PauseScene extends Phaser.Scene {
   create() {
     useCam(this);
     this.add.rectangle(0, 0, GAME_WIDTH, GAME_HEIGHT, 0x000000, 0.6).setOrigin(0);
-    this.add.text(GAME_WIDTH / 2, 70, 'PAUSED', TXT(24, '#ffd54f', { fontStyle: 'bold' })).setOrigin(0.5);
+    glossyTitle(this.add.text(GAME_WIDTH / 2, 70, 'PAUSED', TXT(28, '#ffd54f', { fontStyle: 'bold' })).setOrigin(0.5));
     makeButton(this, GAME_WIDTH / 2, 120, 'RESUME', () => this.resumeGame(), 140);
     makeButton(this, GAME_WIDTH / 2, 150, Sfx.muted ? 'SOUND: OFF' : 'SOUND: ON', () => {
       Sfx.muted = !Sfx.muted;
@@ -2099,8 +2351,9 @@ class LevelCompleteScene extends Phaser.Scene {
     const L = LEVELS[d.levelId];
     const last = !L.next;
     this.cameras.main.setBackgroundColor('#01411c');
+    hi(this.add.image(0, 0, 'backdrop')).setOrigin(0);
     truckBorder(this);
-    this.add.text(GAME_WIDTH / 2, 36, last ? 'KITE RECOVERED!' : 'SHABAASH!', TXT(24, '#ffd54f', { fontStyle: 'bold', stroke: '#000', strokeThickness: 4 })).setOrigin(0.5);
+    glossyTitle(this.add.text(GAME_WIDTH / 2, 36, last ? 'KITE RECOVERED!' : 'SHABAASH!', TXT(28, '#ffd54f', { fontStyle: 'bold', stroke: '#000', strokeThickness: 5 })).setOrigin(0.5));
     this.add.text(GAME_WIDTH / 2, 62, `${L.id}  ${L.name} complete`, TXT(10)).setOrigin(0.5);
     const lines = [
       ['Jalebis', `${d.jalebis} x 10`, d.jalebis * 10],
@@ -2136,7 +2389,7 @@ class GameOverScene extends Phaser.Scene {
     useCam(this);
     this.cameras.main.fadeIn(250);
     this.cameras.main.setBackgroundColor('#1a1a1a');
-    this.add.text(GAME_WIDTH / 2, 80, 'GAME OVER', TXT(28, '#e53935', { fontStyle: 'bold', stroke: '#000', strokeThickness: 4 })).setOrigin(0.5);
+    glossyTitle(this.add.text(GAME_WIDTH / 2, 80, 'GAME OVER', TXT(32, '#e53935', { fontStyle: 'bold', stroke: '#000', strokeThickness: 5 })).setOrigin(0.5), '#ffd0c8', '#ff6f60', '#e53935', '#8e0000');
     this.add.text(GAME_WIDTH / 2, 116, `Final score: ${this.registry.get('score') || 0}`, TXT(12)).setOrigin(0.5);
     this.add.text(GAME_WIDTH / 2, 136, 'Himmat na haaro! Try again.', TXT(10, '#a5d6a7')).setOrigin(0.5);
     const retry = () => {
@@ -2151,12 +2404,17 @@ class GameOverScene extends Phaser.Scene {
 }
 
 /* ------------------------------ 12. BOOTSTRAP ----------------------------- */
-const game = new Phaser.Game({
+const fontsReady = document.fonts && document.fonts.load
+  ? Promise.race([Promise.all([document.fonts.load('800 16px "Baloo 2"'), document.fonts.load('600 16px "Baloo 2"')]), new Promise(r => setTimeout(r, 1500))])
+  : Promise.resolve();
+let game;
+fontsReady.catch(() => {}).then(() => { game = new Phaser.Game({
   type: Phaser.AUTO,
   parent: 'game',
   width: GAME_WIDTH * Z,
   height: GAME_HEIGHT * Z,
-  pixelArt: true,
+  pixelArt: false,
+  antialias: true,
   backgroundColor: '#0b0f14',
   scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH, fullscreenTarget: 'app' },
   physics: { default: 'arcade', arcade: { gravity: { y: GRAVITY }, debug: DEBUG } },
@@ -2164,6 +2422,9 @@ const game = new Phaser.Game({
   scene: [BootScene, MenuScene, CharacterSelectScene, LevelSelectScene, GameScene, HUDScene,
           PauseScene, LevelCompleteScene, GameOverScene]
 });
+  startGameHooks();
+});
+function startGameHooks() {
 if (EXPOSE) window.__phaser = game;
 
 // Keep the game exactly the size of the *visible* screen (mobile address bars change it).
@@ -2172,6 +2433,7 @@ function fitToScreen() {
   const vv = window.visualViewport;
   el.style.width = Math.round(vv ? vv.width : window.innerWidth) + 'px';
   el.style.height = Math.round(vv ? vv.height : window.innerHeight) + 'px';
+  if (!game) return;
   if (game.canvas && game.isBooted) game.scale.refresh();
   // size the touch buttons to fit the empty strips beside the game where possible
   const w = vv ? vv.width : window.innerWidth, h = vv ? vv.height : window.innerHeight;
@@ -2187,6 +2449,7 @@ window.addEventListener('orientationchange', () => setTimeout(fitToScreen, 250))
 if (window.visualViewport) window.visualViewport.addEventListener('resize', fitToScreen);
 game.events.once('ready', fitToScreen);
 fitToScreen();
+}
 </script>
 </body>
 </html>
