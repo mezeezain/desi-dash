@@ -69,7 +69,7 @@
 const TILE            = 16;
 const GAME_WIDTH      = 480;
 const GAME_HEIGHT     = 270;
-const GRAVITY         = 1200;
+const GRAVITY         = 1050;
 const COYOTE_MS       = 120;
 const JUMP_BUFFER_MS  = 160;
 const MAX_FALL_SPEED  = 600;
@@ -78,7 +78,7 @@ const LEVEL_TIME      = 300;
 const WORLD_H         = 400;   // physics bounds (deeper than camera so falls kill)
 const CAM_H           = 272;
 
-const VERSION = '202610261729';
+const VERSION = '202610261801';
 // If the phone is showing an old cached copy, reload once with the new version in the URL
 // (a new URL bypasses GitHub Pages' 10-minute cache).
 (function checkForUpdate() {
@@ -129,7 +129,8 @@ const TOUCH_META = { dirSince: 0, jumpHoldUntil: 0 };
     }).filter(b => b.r > 0);
   };
   window.__measurePad = measure;
-  /** nearest button whose generous touch zone (1.45x its radius) contains the point */
+  /** nearest button whose generous touch zone (1.6x its radius) contains the point;
+      anywhere else on the right half of the screen (below the score bar) is a jump */
   const keyAt = (x, y) => {
     if (!buttons.length) measure();
     let best = null, bestD = Infinity;
@@ -137,6 +138,7 @@ const TOUCH_META = { dirSince: 0, jumpHoldUntil: 0 };
       const d = Math.hypot(x - b.x, y - b.y) / b.r;
       if (d < 1.6 && d < bestD) { best = b.k; bestD = d; }
     }
+    if (!best && x > window.innerWidth * 0.5 && y > window.innerHeight * 0.16) best = 'jump';
     return best;
   };
   const sync = () => {
@@ -192,32 +194,32 @@ function goFullscreen(scene) {
 const HEROES = [
   { id:'ali', name:'Ali', urdu:'علی', ability:'fastThrow',
     palette:{ skin:'#c68642', hair:'#151515', top:'#2e7d32', bottom:'#f2f2f2', shoe:'#e0e0e0', cap:'#1b5e20', scarf:'#1b5e20' },
-    stats:{ walkSpeed:160, runSpeed:260, jump:420, accel:900 },
+    stats:{ walkSpeed:145, runSpeed:235, jump:395, accel:800 },
     bio:"Lahore's fastest bowler." },
 
   { id:'ayesha', name:'Ayesha', urdu:'عائشہ', ability:'speedster',
     palette:{ longHair:true, skin:'#a9714b', hair:'#1a1a1a', top:'#e91e63', bottom:'#f8bbd0', shoe:'#ffffff', scarf:'#ff4081' },
-    stats:{ walkSpeed:170, runSpeed:300, jump:420, accel:950 },
+    stats:{ walkSpeed:155, runSpeed:265, jump:395, accel:850 },
     bio:"Karachi's sprint champion." },
 
   { id:'hamza', name:'Hamza', urdu:'حمزہ', ability:'brickBreaker',
     palette:{ skin:'#8d5524', hair:'#111', top:'#37474f', bottom:'#e8e0d0', shoe:'#6d4c41', cap:'#263238' },
-    stats:{ walkSpeed:150, runSpeed:250, jump:430, accel:880 },
+    stats:{ walkSpeed:140, runSpeed:225, jump:405, accel:780 },
     bio:"Peshawar's strongest kid." },
 
   { id:'zara', name:'Zara', urdu:'زارا', ability:'doubleJump',
     palette:{ longHair:true, skin:'#b5764a', hair:'#2b1b12', top:'#1565c0', bottom:'#0d47a1', shoe:'#ffffff', scarf:'#c62828' },
-    stats:{ walkSpeed:150, runSpeed:245, jump:410, accel:950 },
+    stats:{ walkSpeed:142, runSpeed:228, jump:385, accel:820 },
     bio:"Hyderabad's ajrak painter." },
 
   { id:'bilal', name:'Bilal', urdu:'بلال', ability:'wallJump',
     palette:{ skin:'#d1a07a', hair:'#3e2723', top:'#6d4c41', bottom:'#3e2723', shoe:'#212121', cap:'#8d6e63' },
-    stats:{ walkSpeed:155, runSpeed:255, jump:420, accel:900 },
+    stats:{ walkSpeed:143, runSpeed:230, jump:395, accel:800 },
     bio:"Hunza's mountain climber." },
 
   { id:'mahnoor', name:'Mahnoor', urdu:'مہنور', ability:'glide',
     palette:{ longHair:true, skin:'#e0ac69', hair:'#1c1c1c', top:'#fdd835', bottom:'#42a5f5', shoe:'#ffffff', scarf:'#8e24aa' },
-    stats:{ walkSpeed:155, runSpeed:250, jump:420, accel:900 },
+    stats:{ walkSpeed:143, runSpeed:228, jump:395, accel:800 },
     bio:"Islamabad's kite champion." }
 ];
 
@@ -998,8 +1000,7 @@ class InputManager {
   get right() { const k = this.keys; return !!(k.RIGHT.isDown || k.D.isDown || this.touch.right || this.padBtn(15) || this.stickX() > 0.4); }
   get run()   {
     const k = this.keys;
-    const touchAutoRun = (this.touch.left || this.touch.right) && performance.now() - TOUCH_META.dirSince > 450;
-    return !!(k.SHIFT.isDown || k.J.isDown || this.touch.action || touchAutoRun || this.padBtn(2));
+    return !!(k.SHIFT.isDown || k.J.isDown || this.touch.action || this.padBtn(2));
   }
   get jumpHeld() {
     const k = this.keys;
@@ -1152,7 +1153,7 @@ class Player extends Phaser.Physics.Arcade.Sprite {
     if (!onGround) {
       if (vy < 0 && !inp.jumpHeld) extraG = 1500;           // let go early -> shorter hop
       else if (Math.abs(vy) < 70 && inp.jumpHeld) extraG = -500; // apex hang while holding
-      else if (vy > 0) extraG = 450;                          // fall a little faster than the rise
+      else if (vy > 0) extraG = 300;                          // fall a little faster than the rise
     }
     body.setGravityY(extraG);
 
@@ -1186,6 +1187,8 @@ class Player extends Phaser.Physics.Arcade.Sprite {
 
   doJump(power) {
     this.body.setVelocityY(-power);
+    this.y -= 2;                 // show the take-off on this very frame
+    this.fsm.set('jump');
     this.scene.fx.dust(this.x, this.body.bottom, 3);
     this.lastJumpPressed = -99999;
     this.lastGrounded = -99999;
@@ -1693,8 +1696,9 @@ class GameScene extends Phaser.Scene {
     const startX = this.respawnX || 6 * TILE;   // clear of the on-screen buttons at level start
     this.player = new Player(this, startX, gt - 24, this.hero, this.inputMgr);
     this.camFollow = true;
-    this.lookAhead = 0;
-    this.cameras.main.scrollX = Phaser.Math.Clamp(this.player.x - GAME_WIDTH / 2, 0, W - GAME_WIDTH);
+    this.cameras.main.scrollX = Phaser.Math.Clamp(this.player.x - GAME_WIDTH * 0.4, 0, W - GAME_WIDTH);
+    // camera runs after physics has moved the sprites, so hero and world never drift apart
+    this.events.on('postupdate', this.updateCamera, this);
 
     /* cricket balls (object pool) */
     this.balls = this.physics.add.group({ maxSize: 3 });
@@ -1721,9 +1725,15 @@ class GameScene extends Phaser.Scene {
     this.scene.launch('HUD', { inputMgr: this.inputMgr });
     this.scene.bringToTop('HUD');
     this.showBanner(`${L.id}  ${L.name}`);
+    if (IS_TOUCH && !this.respawnX && L.id === '1-1') {
+      const hint = this.add.text(GAME_WIDTH / 2, 96, 'Tip: tap anywhere on the right side to jump',
+        TXT(9, '#ffffff', { fontStyle: 'bold', stroke: '#000', strokeThickness: 3 })).setOrigin(0.5).setScrollFactor(0).setDepth(50);
+      this.tweens.add({ targets: hint, alpha: 0, delay: 4000, duration: 600, onComplete: () => hint.destroy() });
+    }
 
     this.keyPause = [this.inputMgr.keys.ESC, this.inputMgr.keys.P];
-    this.events.on('resume', () => window.__resetTouch());
+    this.events.on('resume', () => { window.__resetTouch(); document.body.classList.add('playing'); });
+    this.events.on('pause', () => { window.__resetTouch(); document.body.classList.remove('playing'); });
     document.body.classList.add('playing');
     this.events.once('shutdown', () => { document.body.classList.remove('playing'); window.__resetTouch(); });
 
@@ -1759,6 +1769,26 @@ class GameScene extends Phaser.Scene {
     this.add.rectangle(0, gt + 4, GAME_WIDTH, 6, 0x000000, 0.18).setOrigin(0).setScrollFactor(0).setDepth(-4.4);
     this.mid = layer(`mid-${L.id}`, gt + (th === 'lahore' ? 6 : 12), -6);
     this.near = layer(`near-${L.id}`, gt + 4, -5);
+  }
+
+  /** Mario-style camera: the hero can move freely inside a window in the middle of the
+      screen; the view only scrolls (smoothly) when they push past its edges. */
+  updateCamera(time, delta) {
+    const cam = this.cameras.main, p = this.player;
+    if (this.camFollow && p) {
+      const winL = cam.scrollX + GAME_WIDTH * 0.36, winR = cam.scrollX + GAME_WIDTH * 0.5;
+      let target = cam.scrollX;
+      if (p.x > winR) target = p.x - GAME_WIDTH * 0.5;
+      else if (p.x < winL) target = p.x - GAME_WIDTH * 0.36;
+      target = Phaser.Math.Clamp(target, 0, this.levelW - GAME_WIDTH);
+      const k = 1 - Math.pow(0.8, Math.min(delta, 50) / 16.67);
+      cam.scrollX += (target - cam.scrollX) * k;
+      if (Math.abs(target - cam.scrollX) < 0.05) cam.scrollX = target;
+      cam.scrollY = 0;
+    }
+    if (this.far) this.far.tilePositionX = cam.scrollX * 0.12;
+    if (this.mid) this.mid.tilePositionX = cam.scrollX * 0.3 + (this.themeName === 'karachi' ? time * 0.004 : 0);
+    if (this.near) this.near.tilePositionX = cam.scrollX * 0.55;
   }
 
   isSolidAt(px, py) {
@@ -1984,19 +2014,6 @@ class GameScene extends Phaser.Scene {
       }
     }
 
-    // smooth camera: frame-rate independent ease toward the hero, with a little look-ahead
-    const cam = this.cameras.main;
-    if (this.camFollow) {
-      const k = 1 - Math.pow(0.82, delta / 16.67);
-      this.lookAhead += ((p.facing || 1) * Math.min(48, Math.abs(p.body.velocity.x) * 0.18) - this.lookAhead) * k * 0.5;
-      const target = Phaser.Math.Clamp(p.x + this.lookAhead - GAME_WIDTH / 2, 0, this.levelW - GAME_WIDTH);
-      cam.scrollX += (target - cam.scrollX) * k;
-      cam.scrollY = Phaser.Math.Clamp(cam.scrollY, 0, CAM_H - GAME_HEIGHT);
-    }
-    // parallax
-    if (this.far) this.far.tilePositionX = cam.scrollX * 0.12;
-    if (this.mid) this.mid.tilePositionX = cam.scrollX * 0.3 + (this.themeName === 'karachi' ? time * 0.004 : 0);
-    if (this.near) this.near.tilePositionX = cam.scrollX * 0.55;
   }
 }
 
